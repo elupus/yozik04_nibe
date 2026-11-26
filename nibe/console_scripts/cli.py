@@ -16,7 +16,6 @@ from ..coil import CoilData
 from ..connection import Connection
 from ..connection.modbus import Modbus
 from ..connection.nibegw import Block, NibeGW
-from ..connection.nibegw_noise import NibeGWNoise
 from ..exceptions import CoilNotFoundException, NibeException
 from ..heatpump import HeatPump, Model, Series
 from ..log_set import (
@@ -119,40 +118,6 @@ async def nibegw(
     ctx.obj = await ctx.with_async_resource(ConnectionContext(heatpump, connection))
 
 
-@cli.group(
-    chain=True, help="Connect using encrypted nibegw protocol (ESPHome udp_noise)"
-)
-@click.argument("remote_ip", type=str)
-@click.option("--key", type=str, required=True, envvar="NIBEGW_NOISE_KEY")
-@click.option("--remote_port", type=int, default=9999)
-@click.option(
-    "--model",
-    type=click.Choice([model.name for model in Model.__members__.values()]),
-    default=None,
-)
-@click.pass_context
-async def nibegw_noise(
-    ctx: click.Context,
-    remote_ip: str,
-    key: str,
-    remote_port: int,
-    model: str | None,
-):
-    heatpump = HeatPump()
-    if model:
-        heatpump.model = Model[model]
-        await heatpump.initialize()
-
-    connection = NibeGWNoise(
-        heatpump=heatpump,
-        remote_ip=remote_ip,
-        key=key,
-        remote_port=remote_port,
-    )
-
-    ctx.obj = await ctx.with_async_resource(ConnectionContext(heatpump, connection))
-
-
 @cli.group(chain=True, help="Connect using modbus protocol")
 @click.argument("remote_ip", type=str)
 @click.option("--remote_port", type=int, default=502)
@@ -179,7 +144,6 @@ async def modbus(
 
 def add_connect_command(command: click.Command):
     nibegw.add_command(command)
-    nibegw_noise.add_command(command)
     modbus.add_command(command)
 
 

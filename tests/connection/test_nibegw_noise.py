@@ -11,14 +11,11 @@ from nibe.coil import CoilData
 from nibe.connection.mixins import ConnectionStatus
 from nibe.connection.nibegw_noise import (
     HANDSHAKE_RETRY,
-    INNER_REQUEST,
-    INNER_TELEGRAM,
     KEEPALIVE_INTERVAL,
     PROLOGUE,
     PROTOCOL_NAME,
     SESSION_TIMEOUT,
     TYPE_HANDSHAKE_INITIATION,
-    TYPE_HANDSHAKE_REJECT,
     TYPE_HANDSHAKE_RESPONSE,
     Handshake,
     NibeGWNoise,
@@ -51,11 +48,7 @@ class FakeGateway:
         try:
             noise.read_message(packet[8:])
         except Exception:
-            return (
-                bytes([TYPE_HANDSHAKE_REJECT, 0, 0, 0])
-                + struct.pack("<I", remote_index)
-                + b"Invalid key"
-            )
+            return None  # dropped
         local_index = secrets.randbits(32)
         response = (
             bytes([TYPE_HANDSHAKE_RESPONSE, 0, 0, 0])
@@ -72,7 +65,7 @@ class FakeGateway:
         return response
 
     def telegram(self, frame: str) -> bytes:
-        return self.session.seal(bytes([INNER_TELEGRAM]) + binascii.unhexlify(frame))
+        return self.session.seal(binascii.unhexlify(frame))
 
 
 @pytest.fixture(name="heatpump")
@@ -102,11 +95,16 @@ def _last_sent(transport: Mock) -> bytes:
 
 def _connect(nibegw: NibeGWNoise, transport: Mock, gateway: FakeGateway, now=0.0):
     nibegw._tick(now)
-    response = gateway.respond(_last_sent(transport))
-    nibegw.datagram_received(response, GW_ADDR)
+    nibegw.datagram_received(gateway.respond(_last_sent(transport)), GW_ADDR)
     # The client confirms the session with a keepalive
     assert gateway.session.open(_last_sent(transport)) == b""
     transport.sendto.reset_mock()
+
+
+def _pair():
+    a = Session(b"\x01" * 32, b"\x02" * 32, local_index=1, remote_index=2)
+    b = Session(b"\x02" * 32, b"\x01" * 32, local_index=2, remote_index=1)
+    return a, b
 
 
 def test_decode_key():
@@ -131,12 +129,6 @@ def test_initiation_format():
     assert struct.unpack("<I", packet[4:8])[0] == handshake.sender_index
 
 
-def _pair():
-    a = Session(b"\x01" * 32, b"\x02" * 32, local_index=1, remote_index=2)
-    b = Session(b"\x02" * 32, b"\x01" * 32, local_index=2, remote_index=1)
-    return a, b
-
-
 def test_session_format():
     a, b = _pair()
     packet = a.seal(b"abc")
@@ -147,15 +139,13 @@ def test_session_format():
     assert a.open(packet) is None  # wrong receiver index
 
 
-def test_session_replay_and_reorder():
+def test_session_counters():
     a, b = _pair()
     p0 = a.seal(b"zero")
     p1 = a.seal(b"one")
-    p2 = a.seal(b"two")
 
-    assert b.open(p2) == b"two"
-    assert b.open(p0) == b"zero"  # reordered within window
     assert b.open(p1) == b"one"
+    assert b.open(p0) is None  # older counter
     assert b.open(p1) is None  # replay
 
     tampered = bytearray(a.seal(b"data"))
@@ -166,14 +156,6 @@ def test_session_replay_and_reorder():
     packet = bytearray(a.seal(b"data"))
     packet[8] ^= 1
     assert b.open(bytes(packet)) is None
-
-
-def test_session_window():
-    a, b = _pair()
-    old = a.seal(b"old")
-    for _ in range(70):
-        assert b.open(a.seal(b"x")) == b"x"
-    assert b.open(old) is None  # outside the replay window
 
 
 async def test_handshake_and_telegram(
@@ -193,35 +175,31 @@ async def test_handshake_and_telegram(
     assert coil_data.value == 3245
 
 
-async def test_wrong_key_rejected_and_retried(
-    nibegw: NibeGWNoise, transport: Mock, caplog
-):
+async def test_wrong_key_retried(nibegw: NibeGWNoise, transport: Mock):
     gateway = FakeGateway(bytes(32))
     nibegw._tick(0)
-    nibegw.datagram_received(gateway.respond(_last_sent(transport)), GW_ADDR)
-    assert "Invalid key" in caplog.text
-    assert nibegw._current is None
+    assert gateway.respond(_last_sent(transport)) is None
     transport.sendto.reset_mock()
 
     nibegw._tick(HANDSHAKE_RETRY - 1)
     transport.sendto.assert_not_called()
     nibegw._tick(HANDSHAKE_RETRY)
     assert _last_sent(transport)[0] == TYPE_HANDSHAKE_INITIATION
+    assert nibegw._session is None
 
 
 async def test_ignores_unrelated_response(nibegw: NibeGWNoise, transport: Mock):
     nibegw._tick(0)
-    other = Handshake(PSK)
-    response = FakeGateway().respond(other.initiation())
+    response = FakeGateway().respond(Handshake(PSK).initiation())
     nibegw.datagram_received(response, GW_ADDR)
-    assert nibegw._current is None
+    assert nibegw._session is None
 
 
 async def test_ignores_forged_data(nibegw: NibeGWNoise, transport: Mock):
     gateway = FakeGateway()
     _connect(nibegw, transport, gateway)
-    forged = Session(b"\x05" * 32, b"\x06" * 32, 0, nibegw._current.local_index)
-    nibegw.datagram_received(forged.seal(bytes([INNER_TELEGRAM]) + b"\x5c"), GW_ADDR)
+    forged = Session(b"\x05" * 32, b"\x06" * 32, 0, nibegw._session.local_index)
+    nibegw.datagram_received(forged.seal(b"\x5c"), GW_ADDR)
     assert nibegw.status != ConnectionStatus.CONNECTED
 
 
@@ -240,13 +218,12 @@ async def test_lost_session_reconnects(nibegw: NibeGWNoise, transport: Mock):
     _connect(nibegw, transport, gateway)
     nibegw._last_rx = 100
     nibegw._tick(100 + SESSION_TIMEOUT)
-    assert nibegw._current is None
+    assert nibegw._session is None
     assert nibegw.status == ConnectionStatus.LISTENING
     assert _last_sent(transport)[0] == TYPE_HANDSHAKE_INITIATION
 
-    # A new session replaces the lost one
     nibegw.datagram_received(gateway.respond(_last_sent(transport)), GW_ADDR)
-    assert nibegw._current is not None
+    assert nibegw._session is not None
 
 
 async def test_read_coil(nibegw: NibeGWNoise, transport: Mock, heatpump: HeatPump):
@@ -257,9 +234,8 @@ async def test_read_coil(nibegw: NibeGWNoise, transport: Mock, heatpump: HeatPum
     async def respond():
         await asyncio.sleep(0)
         request = gateway.session.open(_last_sent(transport))
-        assert request[0] == INNER_REQUEST
-        assert struct.unpack("<HB", request[1:4]) == (0x20, 0x69)
-        assert request[4:] == binascii.unhexlify("c0690298a99a")
+        assert struct.unpack("<HB", request[:3]) == (0x20, 0x69)
+        assert request[3:] == binascii.unhexlify("c0690298a99a")
         nibegw.datagram_received(gateway.telegram("5c00206a0698a9ad0c0000dc"), GW_ADDR)
 
     asyncio.create_task(respond())
@@ -275,8 +251,8 @@ async def test_write_coil(nibegw: NibeGWNoise, transport: Mock, heatpump: HeatPu
     async def respond():
         await asyncio.sleep(0)
         request = gateway.session.open(_last_sent(transport))
-        assert struct.unpack("<HB", request[1:4]) == (0x20, 0x6B)
-        assert request[4:] == binascii.unhexlify("c06b0604bc0400000011")
+        assert struct.unpack("<HB", request[:3]) == (0x20, 0x6B)
+        assert request[3:] == binascii.unhexlify("c06b0604bc0400000011")
         nibegw.datagram_received(gateway.telegram("5c00206c01014c"), GW_ADDR)
 
     asyncio.create_task(respond())
