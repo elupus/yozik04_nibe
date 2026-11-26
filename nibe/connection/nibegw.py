@@ -285,7 +285,7 @@ class NibeGW(asyncio.DatagramProtocol, Connection, EventServer, ConnectionStatus
             )
 
             try:
-                self._transport.sendto(data, (self._remote_ip, self._remote_read_port))
+                self._send_request(data, self._remote_read_port)
             except socket.gaierror:
                 raise ReadSendException(f"Unable to lookup hostname: {self._remote_ip}")
 
@@ -371,7 +371,7 @@ class NibeGW(asyncio.DatagramProtocol, Connection, EventServer, ConnectionStatus
             )
 
             try:
-                self._transport.sendto(data, (self._remote_ip, self._remote_write_port))
+                self._send_request(data, self._remote_write_port)
             except socket.gaierror:
                 raise CoilWriteSendException(
                     f"Unable to lookup hostname: {self._remote_ip}"
@@ -392,6 +392,11 @@ class NibeGW(asyncio.DatagramProtocol, Connection, EventServer, ConnectionStatus
                 )
             finally:
                 del self._futures["write"]
+
+    def _send_request(self, data: bytes, port: int) -> None:
+        """Send a request frame to the gateway."""
+        assert self._transport, "Transport is closed"
+        self._transport.sendto(data, (self._remote_ip, port))
 
     def error_received(self, exc):
         """Handle errors from the transport"""
