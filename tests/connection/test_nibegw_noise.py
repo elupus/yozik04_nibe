@@ -91,6 +91,8 @@ async def fixture_nibegw(heatpump: HeatPump):
 async def fixture_noise(nibegw: NibeGWNoise, transport: Mock):
     noise = NoiseDatagramProtocol(nibegw, PSK)
     noise.connection_made(transport)
+    # The tests drive the timer themselves through _tick
+    noise._stop_timer()
     yield noise
     await nibegw.stop()
 
@@ -292,5 +294,13 @@ async def test_write_coil(
 async def test_request_dropped_without_session(
     nibegw: NibeGWNoise, noise: NoiseDatagramProtocol, transport: Mock
 ):
-    noise.send_request(0x20, b"\xc0\x69\x02\x98\xa9\x00")
+    noise.send(b"\x20\x00\x69\xc0\x69\x02\x98\xa9\x00")
     transport.sendto.assert_not_called()
+
+
+async def test_transport_protocol(nibegw: NibeGWNoise, noise: NoiseDatagramProtocol):
+    transport = nibegw._transport
+    assert transport.get_protocol() is nibegw
+    other = Mock(spec=asyncio.DatagramProtocol)
+    transport.set_protocol(other)
+    assert noise.app is other

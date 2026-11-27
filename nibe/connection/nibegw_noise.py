@@ -175,15 +175,25 @@ class Handshake:
 
 
 class NoiseDatagramTransport(asyncio.DatagramTransport):
-    """Transport handed to the NibeGW protocol, sends request frames encrypted."""
+    """Transport handed to the application protocol, encrypts what it sends.
+
+    The session is bound to the gateway, so addr is ignored like for a
+    connected datagram socket.
+    """
 
     def __init__(self, noise: NoiseDatagramProtocol) -> None:
         super().__init__()
         self._noise = noise
 
     def sendto(self, data, addr=None) -> None:
-        """Send a request frame, addr is the accessory address it is for."""
-        self._noise.send_request(addr, data)
+        self._noise.send(data)
+
+    def get_protocol(self) -> asyncio.BaseProtocol:
+        return self._noise.app
+
+    def set_protocol(self, protocol: asyncio.BaseProtocol) -> None:
+        assert isinstance(protocol, asyncio.DatagramProtocol)
+        self._noise.app = protocol
 
     def close(self) -> None:
         self._noise.close()
@@ -202,12 +212,12 @@ class NoiseDatagramProtocol(asyncio.DatagramProtocol):
     """Encrypted session on a UDP socket.
 
     Sits between the socket and an application protocol, like asyncio's TLS
-    support: the application gets a NoiseDatagramTransport and receives the
-    decrypted frames.
+    support: the application gets a NoiseDatagramTransport, whose sendto
+    encrypts, and receives the decrypted payloads.
     """
 
     def __init__(self, app: asyncio.DatagramProtocol, psk: bytes) -> None:
-        self._app = app
+        self.app = app
         self._psk = psk
         self._transport: Optional[asyncio.DatagramTransport] = None
         self._session: Optional[Session] = None
@@ -217,16 +227,15 @@ class NoiseDatagramProtocol(asyncio.DatagramProtocol):
         self._task: Optional[asyncio.Task] = None
         self.established = asyncio.Event()
 
-    def start(self) -> None:
-        """Start the handshake and keepalive timer."""
-        self._task = asyncio.create_task(self._run())
-
     def close(self) -> None:
+        self._stop_timer()
+        if self._transport:
+            self._transport.close()
+
+    def _stop_timer(self) -> None:
         if self._task:
             self._task.cancel()
             self._task = None
-        if self._transport:
-            self._transport.close()
 
     def is_closing(self) -> bool:
         return self._transport is None or self._transport.is_closing()
@@ -237,11 +246,14 @@ class NoiseDatagramProtocol(asyncio.DatagramProtocol):
 
     def connection_made(self, transport) -> None:
         self._transport = transport
-        self._app.connection_made(NoiseDatagramTransport(self))
+        # Handshake and keepalive timer
+        self._task = asyncio.get_running_loop().create_task(self._run())
+        self.app.connection_made(NoiseDatagramTransport(self))
 
     def connection_lost(self, exc: Optional[Exception]) -> None:
+        self._stop_timer()
         self._transport = None
-        self._app.connection_lost(exc)
+        self.app.connection_lost(exc)
 
     def datagram_received(self, data: bytes, addr: Any) -> None:
         if self._handshake and data[:1] == bytes([TYPE_HANDSHAKE_RESPONSE]):
@@ -255,18 +267,18 @@ class NoiseDatagramProtocol(asyncio.DatagramProtocol):
 
         self._last_rx = time.monotonic()
         if plaintext:
-            self._app.datagram_received(plaintext, addr)
+            self.app.datagram_received(plaintext, addr)
 
     def error_received(self, exc: Exception) -> None:
         # An unreachable gateway is handled by handshake retries
         logger.debug(exc)
 
-    def send_request(self, address: int, data: bytes) -> None:
+    def send(self, payload: bytes) -> None:
+        """Encrypt and send a payload, dropped while there is no session."""
         if not self._session:
-            logger.debug("No encrypted session, dropping request")
+            logger.debug("No encrypted session, dropping payload")
             return
-        token = data[1]
-        self._send(self._session, struct.pack("<HB", address, token) + data)
+        self._send(self._session, payload)
 
     def _on_handshake_response(self, handshake: Handshake, data: bytes) -> None:
         try:
@@ -349,7 +361,6 @@ class NibeGWNoise(NibeGWBase):
             lambda: NoiseDatagramProtocol(self, self._psk),
             remote_addr=(self._remote_ip, self._remote_port),
         )
-        noise.start()
 
         try:
             await asyncio.wait_for(noise.established.wait(), START_TIMEOUT)
@@ -358,4 +369,5 @@ class NibeGWNoise(NibeGWBase):
 
     def _send_request(self, address: int, data: bytes) -> None:
         assert self._transport, "Transport is closed"
-        self._transport.sendto(data, address)
+        token = data[1]
+        self._transport.sendto(struct.pack("<HB", address, token) + data)
