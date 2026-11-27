@@ -82,7 +82,8 @@ import asyncio
 import logging
 
 from nibe.coil import CoilData
-from nibe.connection.nibegw import NibeGW
+from nibe.connection.nibegw import NibeGWProtocol
+from nibe.connection.nibegw_udp import create_nibegw_udp_connection
 from nibe.heatpump import HeatPump, Model
 
 logger = logging.getLogger("nibe").getChild(__name__)
@@ -97,8 +98,10 @@ async def main():
 
     heatpump.subscribe(HeatPump.COIL_UPDATE_EVENT, on_coil_update)
 
-    connection = NibeGW(heatpump=heatpump, remote_ip="192.168.1.2")
-    await connection.start()
+    transport, protocol = await create_nibegw_udp_connection(
+        lambda: NibeGWProtocol(heatpump), remote_ip="192.168.1.2"
+    )
+    await protocol.start()
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.DEBUG)
@@ -107,6 +110,9 @@ if __name__ == '__main__':
     loop.run_until_complete(main())
     loop.run_forever()
 ```
+
+`connection = NibeGW(heatpump=heatpump, remote_ip="192.168.1.2")` with
+`await connection.start()` is still supported and does the same.
 
 ### TCP Modbus
 

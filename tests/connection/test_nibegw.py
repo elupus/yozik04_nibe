@@ -8,6 +8,7 @@ import pytest
 
 from nibe.coil import CoilData
 from nibe.connection.nibegw import ConnectionStatus, NibeGW
+from nibe.connection.nibegw_udp import NibeGWUdpTransport
 from nibe.exceptions import NoMappingException, ReadTimeoutException, WriteException
 from nibe.heatpump import HeatPump, Model, ProductInfo
 
@@ -29,13 +30,13 @@ async def fixture_transport():
 async def fixture_nibegw(heatpump: HeatPump, transport: Mock):
     nibegw = NibeGW(heatpump, "127.0.0.1")
     assert nibegw.status == ConnectionStatus.UNKNOWN
-    nibegw.connection_made(transport)
+    NibeGWUdpTransport(nibegw, "127.0.0.1").connection_made(transport)
     return nibegw
 
 
 def _enqueue_datagram(nibegw: NibeGW, data: str):
     asyncio.get_event_loop().call_soon(
-        nibegw.datagram_received, binascii.unhexlify(data), ("127.0.0.1", 12345)
+        nibegw.frame_received, binascii.unhexlify(data)
     )
 
 
@@ -290,9 +291,8 @@ async def test_read_multiple_with_u32(
     nibegw._table_processing_mode = table_processing_mode
     on_coil_update_mock = Mock()
     heatpump.subscribe("coil_update", on_coil_update_mock)
-    nibegw.datagram_received(
+    nibegw.frame_received(
         binascii.unhexlify(raw.replace(" ", "")),
-        ("127.0.0.1", 12345),
     )
 
     def _call(address, value):
@@ -300,3 +300,18 @@ async def test_read_multiple_with_u32(
 
     # Values with 0000 will not be included in the call list
     assert on_coil_update_mock.mock_calls == [_call(*call) for call in calls]
+
+
+async def test_remote_ip_discovered_from_valid_response(heatpump: HeatPump):
+    nibegw = NibeGW(heatpump)
+    udp = NibeGWUdpTransport(nibegw)
+    udp.connection_made(Mock())
+    assert nibegw.remote_ip is None
+
+    udp.datagram_received(b"garbage", ("10.0.0.2", 9999))
+    assert nibegw.remote_ip is None
+
+    udp.datagram_received(
+        binascii.unhexlify("5c00206a0698a9ad0c0000dc"), ("10.0.0.1", 9999)
+    )
+    assert nibegw.remote_ip == "10.0.0.1"
