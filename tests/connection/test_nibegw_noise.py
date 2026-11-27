@@ -9,7 +9,6 @@ import pytest
 
 from nibe.coil import CoilData
 from nibe.connection.mixins import ConnectionStatus
-from nibe.connection.nibegw import NibeGW
 from nibe.connection.nibegw_noise import (
     HANDSHAKE_RETRY,
     KEEPALIVE_INTERVAL,
@@ -19,7 +18,8 @@ from nibe.connection.nibegw_noise import (
     TYPE_HANDSHAKE_INITIATION,
     TYPE_HANDSHAKE_RESPONSE,
     Handshake,
-    NibeGWNoiseTransport,
+    NibeGWNoise,
+    NoiseDatagramProtocol,
     Session,
     decode_key,
     derive_key,
@@ -82,18 +82,16 @@ async def fixture_transport():
     return Mock()
 
 
-@pytest.fixture(name="noise")
-async def fixture_noise():
-    return NibeGWNoiseTransport("127.0.0.1", KEY)
-
-
 @pytest.fixture(name="nibegw")
-async def fixture_nibegw(
-    heatpump: HeatPump, noise: NibeGWNoiseTransport, transport: Mock
-):
-    nibegw = NibeGW(heatpump, transport=noise)
+async def fixture_nibegw(heatpump: HeatPump):
+    return NibeGWNoise(heatpump, "127.0.0.1", KEY)
+
+
+@pytest.fixture(name="noise")
+async def fixture_noise(nibegw: NibeGWNoise, transport: Mock):
+    noise = NoiseDatagramProtocol(nibegw, PSK)
     noise.connection_made(transport)
-    yield nibegw
+    yield noise
     await nibegw.stop()
 
 
@@ -102,7 +100,7 @@ def _last_sent(transport: Mock) -> bytes:
 
 
 def _connect(
-    noise: NibeGWNoiseTransport, transport: Mock, gateway: FakeGateway, now=0.0
+    noise: NoiseDatagramProtocol, transport: Mock, gateway: FakeGateway, now=0.0
 ):
     noise._tick(now)
     noise.datagram_received(gateway.respond(_last_sent(transport)), GW_ADDR)
@@ -169,7 +167,10 @@ def test_session_counters():
 
 
 async def test_handshake_and_telegram(
-    nibegw: NibeGW, noise: NibeGWNoiseTransport, transport: Mock, heatpump: HeatPump
+    nibegw: NibeGWNoise,
+    noise: NoiseDatagramProtocol,
+    transport: Mock,
+    heatpump: HeatPump,
 ):
     gateway = FakeGateway()
     _connect(noise, transport, gateway)
@@ -186,7 +187,7 @@ async def test_handshake_and_telegram(
 
 
 async def test_wrong_key_retried(
-    nibegw: NibeGW, noise: NibeGWNoiseTransport, transport: Mock
+    nibegw: NibeGWNoise, noise: NoiseDatagramProtocol, transport: Mock
 ):
     gateway = FakeGateway(bytes(32))
     noise._tick(0)
@@ -201,7 +202,7 @@ async def test_wrong_key_retried(
 
 
 async def test_ignores_unrelated_response(
-    nibegw: NibeGW, noise: NibeGWNoiseTransport, transport: Mock
+    nibegw: NibeGWNoise, noise: NoiseDatagramProtocol, transport: Mock
 ):
     noise._tick(0)
     response = FakeGateway().respond(Handshake(PSK).initiation())
@@ -210,7 +211,7 @@ async def test_ignores_unrelated_response(
 
 
 async def test_ignores_forged_data(
-    nibegw: NibeGW, noise: NibeGWNoiseTransport, transport: Mock
+    nibegw: NibeGWNoise, noise: NoiseDatagramProtocol, transport: Mock
 ):
     gateway = FakeGateway()
     _connect(noise, transport, gateway)
@@ -219,7 +220,9 @@ async def test_ignores_forged_data(
     assert nibegw.status != ConnectionStatus.CONNECTED
 
 
-async def test_keepalive(nibegw: NibeGW, noise: NibeGWNoiseTransport, transport: Mock):
+async def test_keepalive(
+    nibegw: NibeGWNoise, noise: NoiseDatagramProtocol, transport: Mock
+):
     gateway = FakeGateway()
     _connect(noise, transport, gateway)
     noise._last_rx = noise._last_tx = 100
@@ -230,14 +233,13 @@ async def test_keepalive(nibegw: NibeGW, noise: NibeGWNoiseTransport, transport:
 
 
 async def test_lost_session_reconnects(
-    nibegw: NibeGW, noise: NibeGWNoiseTransport, transport: Mock
+    nibegw: NibeGWNoise, noise: NoiseDatagramProtocol, transport: Mock
 ):
     gateway = FakeGateway()
     _connect(noise, transport, gateway)
     noise._last_rx = 100
     noise._tick(100 + SESSION_TIMEOUT)
     assert noise._session is None
-    assert nibegw.status == ConnectionStatus.LISTENING
     assert _last_sent(transport)[0] == TYPE_HANDSHAKE_INITIATION
 
     noise.datagram_received(gateway.respond(_last_sent(transport)), GW_ADDR)
@@ -245,7 +247,10 @@ async def test_lost_session_reconnects(
 
 
 async def test_read_coil(
-    nibegw: NibeGW, noise: NibeGWNoiseTransport, transport: Mock, heatpump: HeatPump
+    nibegw: NibeGWNoise,
+    noise: NoiseDatagramProtocol,
+    transport: Mock,
+    heatpump: HeatPump,
 ):
     gateway = FakeGateway()
     _connect(noise, transport, gateway)
@@ -264,7 +269,10 @@ async def test_read_coil(
 
 
 async def test_write_coil(
-    nibegw: NibeGW, noise: NibeGWNoiseTransport, transport: Mock, heatpump: HeatPump
+    nibegw: NibeGWNoise,
+    noise: NoiseDatagramProtocol,
+    transport: Mock,
+    heatpump: HeatPump,
 ):
     gateway = FakeGateway()
     _connect(noise, transport, gateway)
@@ -282,7 +290,7 @@ async def test_write_coil(
 
 
 async def test_request_dropped_without_session(
-    nibegw: NibeGW, noise: NibeGWNoiseTransport, transport: Mock
+    nibegw: NibeGWNoise, noise: NoiseDatagramProtocol, transport: Mock
 ):
-    noise.send_request(b"\xc0\x69\x02\x98\xa9\x00", write=False)
+    noise.send_request(b"\xc0\x69\x02\x98\xa9\x00")
     transport.sendto.assert_not_called()

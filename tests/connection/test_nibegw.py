@@ -29,7 +29,7 @@ async def fixture_transport():
 async def fixture_nibegw(heatpump: HeatPump, transport: Mock):
     nibegw = NibeGW(heatpump, "127.0.0.1")
     assert nibegw.status == ConnectionStatus.UNKNOWN
-    nibegw._transport.connection_made(transport)
+    nibegw.connection_made(transport)
     return nibegw
 
 
