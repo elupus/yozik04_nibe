@@ -16,7 +16,7 @@ from nibe.connection.nibegw_noise import (
     TYPE_HANDSHAKE_RESPONSE,
     Handshake,
     NibeGWNoise,
-    NoiseDatagramProtocol,
+    NoiseTransport,
     Session,
     decode_key,
     derive_key,
@@ -86,7 +86,7 @@ async def fixture_nibegw(heatpump: HeatPump):
 
 @pytest.fixture(name="noise")
 async def fixture_noise(nibegw: NibeGWNoise, transport: Mock):
-    noise = NoiseDatagramProtocol(nibegw, PSK)
+    noise = NoiseTransport(nibegw, PSK)
     noise.connection_made(transport)
     yield noise
     await nibegw.stop()
@@ -96,7 +96,7 @@ def _last_sent(transport: Mock) -> bytes:
     return transport.sendto.call_args.args[0]
 
 
-def _connect(noise: NoiseDatagramProtocol, transport: Mock, gateway: FakeGateway):
+def _connect(noise: NoiseTransport, transport: Mock, gateway: FakeGateway):
     # connection_made has sent the handshake initiation
     noise.datagram_received(gateway.respond(_last_sent(transport)), GW_ADDR)
     # The client confirms the session with a keepalive
@@ -163,7 +163,7 @@ def test_session_counters():
 
 async def test_handshake_and_telegram(
     nibegw: NibeGWNoise,
-    noise: NoiseDatagramProtocol,
+    noise: NoiseTransport,
     transport: Mock,
     heatpump: HeatPump,
 ):
@@ -182,7 +182,7 @@ async def test_handshake_and_telegram(
 
 
 async def test_handshake_sent_and_retried(
-    nibegw: NibeGWNoise, noise: NoiseDatagramProtocol, transport: Mock
+    nibegw: NibeGWNoise, noise: NoiseTransport, transport: Mock
 ):
     assert _last_sent(transport)[0] == TYPE_HANDSHAKE_INITIATION
     assert noise._handshake_timer.when() > asyncio.get_running_loop().time()
@@ -199,7 +199,7 @@ async def test_handshake_sent_and_retried(
 
 
 async def test_timers_after_handshake(
-    nibegw: NibeGWNoise, noise: NoiseDatagramProtocol, transport: Mock
+    nibegw: NibeGWNoise, noise: NoiseTransport, transport: Mock
 ):
     _connect(noise, transport, FakeGateway())
     assert noise._handshake_timer.cancelled()
@@ -212,7 +212,7 @@ async def test_timers_after_handshake(
 
 
 async def test_ignores_unrelated_response(
-    nibegw: NibeGWNoise, noise: NoiseDatagramProtocol, transport: Mock
+    nibegw: NibeGWNoise, noise: NoiseTransport, transport: Mock
 ):
     response = FakeGateway().respond(Handshake(PSK).initiation())
     noise.datagram_received(response, GW_ADDR)
@@ -220,7 +220,7 @@ async def test_ignores_unrelated_response(
 
 
 async def test_ignores_forged_data(
-    nibegw: NibeGWNoise, noise: NoiseDatagramProtocol, transport: Mock
+    nibegw: NibeGWNoise, noise: NoiseTransport, transport: Mock
 ):
     gateway = FakeGateway()
     _connect(noise, transport, gateway)
@@ -229,9 +229,7 @@ async def test_ignores_forged_data(
     assert nibegw.status != ConnectionStatus.CONNECTED
 
 
-async def test_keepalive(
-    nibegw: NibeGWNoise, noise: NoiseDatagramProtocol, transport: Mock
-):
+async def test_keepalive(nibegw: NibeGWNoise, noise: NoiseTransport, transport: Mock):
     gateway = FakeGateway()
     _connect(noise, transport, gateway)
     noise._send_keepalive()
@@ -239,7 +237,7 @@ async def test_keepalive(
 
 
 async def test_lost_session_reconnects(
-    nibegw: NibeGWNoise, noise: NoiseDatagramProtocol, transport: Mock
+    nibegw: NibeGWNoise, noise: NoiseTransport, transport: Mock
 ):
     gateway = FakeGateway()
     _connect(noise, transport, gateway)
@@ -254,7 +252,7 @@ async def test_lost_session_reconnects(
 
 async def test_read_coil(
     nibegw: NibeGWNoise,
-    noise: NoiseDatagramProtocol,
+    noise: NoiseTransport,
     transport: Mock,
     heatpump: HeatPump,
 ):
@@ -276,7 +274,7 @@ async def test_read_coil(
 
 async def test_write_coil(
     nibegw: NibeGWNoise,
-    noise: NoiseDatagramProtocol,
+    noise: NoiseTransport,
     transport: Mock,
     heatpump: HeatPump,
 ):
@@ -296,16 +294,16 @@ async def test_write_coil(
 
 
 async def test_request_dropped_without_session(
-    nibegw: NibeGWNoise, noise: NoiseDatagramProtocol, transport: Mock
+    nibegw: NibeGWNoise, noise: NoiseTransport, transport: Mock
 ):
     transport.sendto.reset_mock()  # the handshake initiation
-    noise.send(b"\x20\x00\x69\xc0\x69\x02\x98\xa9\x00")
+    noise.sendto(b"\x20\x00\x69\xc0\x69\x02\x98\xa9\x00")
     transport.sendto.assert_not_called()
 
 
-async def test_transport_protocol(nibegw: NibeGWNoise, noise: NoiseDatagramProtocol):
-    transport = nibegw._transport
-    assert transport.get_protocol() is nibegw
+async def test_transport_protocol(nibegw: NibeGWNoise, noise: NoiseTransport):
+    assert nibegw._transport is noise
+    assert noise.get_protocol() is nibegw
     other = Mock(spec=asyncio.DatagramProtocol)
-    transport.set_protocol(other)
-    assert noise.app is other
+    noise.set_protocol(other)
+    assert noise.get_protocol() is other

@@ -185,52 +185,21 @@ def _restart_timer(
     return asyncio.get_running_loop().call_later(delay, callback)
 
 
-class NoiseDatagramTransport(asyncio.DatagramTransport):
-    """Transport handed to the application protocol, encrypts what it sends.
+class NoiseTransport(asyncio.DatagramTransport, asyncio.DatagramProtocol):
+    """Encrypted datagram transport on top of a UDP socket.
 
-    The session is bound to the gateway, so addr is ignored like for a
+    To the application protocol it is a DatagramTransport whose sendto
+    encrypts, and which delivers decrypted payloads. To the UDP socket it is
+    the DatagramProtocol that receives the encrypted packets. The session is
+    bound to the gateway, so the sendto address is ignored like for a
     connected datagram socket.
     """
 
-    def __init__(self, noise: NoiseDatagramProtocol) -> None:
+    def __init__(self, protocol: asyncio.DatagramProtocol, psk: bytes) -> None:
         super().__init__()
-        self._noise = noise
-
-    def sendto(self, data, addr=None) -> None:
-        self._noise.send(data)
-
-    def get_protocol(self) -> asyncio.BaseProtocol:
-        return self._noise.app
-
-    def set_protocol(self, protocol: asyncio.BaseProtocol) -> None:
-        assert isinstance(protocol, asyncio.DatagramProtocol)
-        self._noise.app = protocol
-
-    def close(self) -> None:
-        self._noise.close()
-
-    def abort(self) -> None:
-        self._noise.close()
-
-    def is_closing(self) -> bool:
-        return self._noise.is_closing()
-
-    def get_extra_info(self, name, default=None):
-        return self._noise.get_extra_info(name, default)
-
-
-class NoiseDatagramProtocol(asyncio.DatagramProtocol):
-    """Encrypted session on a UDP socket.
-
-    Sits between the socket and an application protocol, like asyncio's TLS
-    support: the application gets a NoiseDatagramTransport, whose sendto
-    encrypts, and receives the decrypted payloads.
-    """
-
-    def __init__(self, app: asyncio.DatagramProtocol, psk: bytes) -> None:
-        self.app = app
+        self._protocol = protocol
         self._psk = psk
-        self._transport: Optional[asyncio.DatagramTransport] = None
+        self._socket: Optional[asyncio.DatagramTransport] = None
         self._session: Optional[Session] = None
         self._handshake: Optional[Handshake] = None
         self._handshake_timer: Optional[asyncio.TimerHandle] = None
@@ -238,27 +207,47 @@ class NoiseDatagramProtocol(asyncio.DatagramProtocol):
         self._session_timer: Optional[asyncio.TimerHandle] = None
         self.established = asyncio.Event()
 
+    # Transport side, used by the application protocol
+
+    def sendto(self, data, addr=None) -> None:
+        if not self._session:
+            logger.debug("No encrypted session, dropping payload")
+            return
+        self._send(self._session, data)
+
     def close(self) -> None:
         self._cancel_timers()
-        if self._transport:
-            self._transport.close()
+        if self._socket:
+            self._socket.close()
+
+    def abort(self) -> None:
+        self.close()
 
     def is_closing(self) -> bool:
-        return self._transport is None or self._transport.is_closing()
+        return self._socket is None or self._socket.is_closing()
 
     def get_extra_info(self, name, default=None):
-        assert self._transport, "Transport is closed"
-        return self._transport.get_extra_info(name, default)
+        assert self._socket, "Transport is closed"
+        return self._socket.get_extra_info(name, default)
+
+    def get_protocol(self) -> asyncio.BaseProtocol:
+        return self._protocol
+
+    def set_protocol(self, protocol: asyncio.BaseProtocol) -> None:
+        assert isinstance(protocol, asyncio.DatagramProtocol)
+        self._protocol = protocol
+
+    # Protocol side, called by the UDP socket
 
     def connection_made(self, transport) -> None:
-        self._transport = transport
+        self._socket = transport
         self._start_handshake()
-        self.app.connection_made(NoiseDatagramTransport(self))
+        self._protocol.connection_made(self)
 
     def connection_lost(self, exc: Optional[Exception]) -> None:
         self._cancel_timers()
-        self._transport = None
-        self.app.connection_lost(exc)
+        self._socket = None
+        self._protocol.connection_lost(exc)
 
     def datagram_received(self, data: bytes, addr: Any) -> None:
         if self._handshake and data[:1] == bytes([TYPE_HANDSHAKE_RESPONSE]):
@@ -274,24 +263,17 @@ class NoiseDatagramProtocol(asyncio.DatagramProtocol):
             self._session_timer, SESSION_TIMEOUT, self._session_lost
         )
         if plaintext:
-            self.app.datagram_received(plaintext, addr)
+            self._protocol.datagram_received(plaintext, addr)
 
     def error_received(self, exc: Exception) -> None:
         # An unreachable gateway is handled by handshake retries
         logger.debug(exc)
 
-    def send(self, payload: bytes) -> None:
-        """Encrypt and send a payload, dropped while there is no session."""
-        if not self._session:
-            logger.debug("No encrypted session, dropping payload")
-            return
-        self._send(self._session, payload)
-
     def _start_handshake(self) -> None:
         """Send a handshake initiation, repeated until the gateway answers."""
-        assert self._transport, "Transport is closed"
+        assert self._socket, "Transport is closed"
         self._handshake = Handshake(self._psk)
-        self._transport.sendto(self._handshake.initiation())
+        self._socket.sendto(self._handshake.initiation())
         self._handshake_timer = _restart_timer(
             self._handshake_timer, HANDSHAKE_RETRY, self._start_handshake
         )
@@ -318,8 +300,8 @@ class NoiseDatagramProtocol(asyncio.DatagramProtocol):
         logger.info("Encrypted session established")
 
     def _send(self, session: Session, plaintext: bytes) -> None:
-        assert self._transport, "Transport is closed"
-        self._transport.sendto(session.seal(plaintext))
+        assert self._socket, "Transport is closed"
+        self._socket.sendto(session.seal(plaintext))
         self._keepalive_timer = _restart_timer(
             self._keepalive_timer, KEEPALIVE_INTERVAL, self._send_keepalive
         )
@@ -374,7 +356,7 @@ class NibeGWNoise(NibeGWBase):
             f"Connecting encrypted session to {self._remote_ip}:{self._remote_port}"
         )
         _, noise = await asyncio.get_running_loop().create_datagram_endpoint(
-            lambda: NoiseDatagramProtocol(self, self._psk),
+            lambda: NoiseTransport(self, self._psk),
             remote_addr=(self._remote_ip, self._remote_port),
         )
 
