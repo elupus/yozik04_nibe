@@ -94,9 +94,8 @@ class NibeGWTransport(ABC):
     and sends request frames to the gateway.
     """
 
-    def __init__(self) -> None:
-        self._on_frame: Callable[[bytes, Any], None] = lambda data, addr: None
-        self._on_status: Callable[[ConnectionStatus], None] = lambda status: None
+    _on_frame: Callable[[bytes, Any], None]
+    _on_status: Callable[[ConnectionStatus], None]
 
     def set_callbacks(
         self,
@@ -138,7 +137,6 @@ class NibeGWUdpTransport(asyncio.DatagramProtocol, NibeGWTransport):
         listening_ip: str = "0.0.0.0",
         listening_port: int = 9999,
     ) -> None:
-        NibeGWTransport.__init__(self)
         self._listening_ip = listening_ip
         self._listening_port = listening_port
         self._remote_ip = remote_ip

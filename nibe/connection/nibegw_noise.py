@@ -189,7 +189,6 @@ class NibeGWNoiseTransport(asyncio.DatagramProtocol, NibeGWTransport):
     def __init__(
         self, remote_ip: str, key: Union[str, bytes], remote_port: int = 9999
     ) -> None:
-        NibeGWTransport.__init__(self)
         self._psk = decode_key(key)
         self._remote_ip = remote_ip
         self._remote_port = remote_port
@@ -259,7 +258,7 @@ class NibeGWNoiseTransport(asyncio.DatagramProtocol, NibeGWTransport):
             logger.debug("No encrypted session, dropping request")
             return
         token = data[1]
-        self._send(struct.pack("<HB", MODBUS40, token) + data)
+        self._send(self._session, struct.pack("<HB", MODBUS40, token) + data)
 
     def _on_handshake_response(self, data: bytes) -> None:
         try:
@@ -274,14 +273,14 @@ class NibeGWNoiseTransport(asyncio.DatagramProtocol, NibeGWTransport):
         self._session = session
         self._last_rx = time.monotonic()
         # The gateway uses the session once it sees data with the new keys
-        self._send(b"")
+        self._send(session, b"")
         self._established.set()
         logger.info("Encrypted session established")
 
-    def _send(self, plaintext: bytes) -> None:
-        if self._session and self._transport:
-            self._transport.sendto(self._session.seal(plaintext))
-            self._last_tx = time.monotonic()
+    def _send(self, session: Session, plaintext: bytes) -> None:
+        assert self._transport, "Transport is closed"
+        self._transport.sendto(session.seal(plaintext))
+        self._last_tx = time.monotonic()
 
     def _tick(self, now: float) -> None:
         if self._session and now - self._last_rx >= SESSION_TIMEOUT:
@@ -299,7 +298,7 @@ class NibeGWNoiseTransport(asyncio.DatagramProtocol, NibeGWTransport):
                 self._handshake = Handshake(self._psk, now)
                 self._transport.sendto(self._handshake.initiation())
         elif now - self._last_tx >= KEEPALIVE_INTERVAL:
-            self._send(b"")
+            self._send(self._session, b"")
 
     async def _run(self) -> None:
         while True:
