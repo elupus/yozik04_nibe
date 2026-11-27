@@ -25,8 +25,7 @@ import binascii
 import logging
 import secrets
 import struct
-import time
-from typing import Any, Literal, Optional, Union
+from typing import Any, Callable, Literal, Optional, Union
 
 from nibe.connection.nibegw import NibeGWBase
 from nibe.exceptions import NibeException
@@ -51,7 +50,6 @@ KEEPALIVE_INTERVAL = 15.0
 # Session considered lost without any packet received in this time
 SESSION_TIMEOUT = 3 * KEEPALIVE_INTERVAL
 START_TIMEOUT = 5.0
-TICK = 1.0
 
 
 def _import_crypto():
@@ -138,10 +136,9 @@ class Session:
 class Handshake:
     """Initiator side of the handshake."""
 
-    def __init__(self, psk: bytes, started: float = 0.0) -> None:
+    def __init__(self, psk: bytes) -> None:
         _, NoiseConnection = _import_crypto()
         self.sender_index = secrets.randbits(32)
-        self.started = started
         self._noise = NoiseConnection.from_name(PROTOCOL_NAME)
         self._noise.set_as_initiator()
         self._noise.set_psks(psk)
@@ -172,6 +169,20 @@ class Handshake:
             self.sender_index,
             remote_index,
         )
+
+
+def _cancel_timer(timer: Optional[asyncio.TimerHandle]) -> None:
+    """Cancel a timer, also safe if it already fired or was cancelled."""
+    if timer:
+        timer.cancel()
+
+
+def _restart_timer(
+    timer: Optional[asyncio.TimerHandle], delay: float, callback: Callable[[], None]
+) -> asyncio.TimerHandle:
+    """Cancel a running timer and start it again."""
+    _cancel_timer(timer)
+    return asyncio.get_running_loop().call_later(delay, callback)
 
 
 class NoiseDatagramTransport(asyncio.DatagramTransport):
@@ -222,20 +233,15 @@ class NoiseDatagramProtocol(asyncio.DatagramProtocol):
         self._transport: Optional[asyncio.DatagramTransport] = None
         self._session: Optional[Session] = None
         self._handshake: Optional[Handshake] = None
-        self._last_rx = 0.0
-        self._last_tx = 0.0
-        self._task: Optional[asyncio.Task] = None
+        self._handshake_timer: Optional[asyncio.TimerHandle] = None
+        self._keepalive_timer: Optional[asyncio.TimerHandle] = None
+        self._session_timer: Optional[asyncio.TimerHandle] = None
         self.established = asyncio.Event()
 
     def close(self) -> None:
-        self._stop_timer()
+        self._cancel_timers()
         if self._transport:
             self._transport.close()
-
-    def _stop_timer(self) -> None:
-        if self._task:
-            self._task.cancel()
-            self._task = None
 
     def is_closing(self) -> bool:
         return self._transport is None or self._transport.is_closing()
@@ -246,12 +252,11 @@ class NoiseDatagramProtocol(asyncio.DatagramProtocol):
 
     def connection_made(self, transport) -> None:
         self._transport = transport
-        # Handshake and keepalive timer
-        self._task = asyncio.get_running_loop().create_task(self._run())
+        self._start_handshake()
         self.app.connection_made(NoiseDatagramTransport(self))
 
     def connection_lost(self, exc: Optional[Exception]) -> None:
-        self._stop_timer()
+        self._cancel_timers()
         self._transport = None
         self.app.connection_lost(exc)
 
@@ -265,7 +270,9 @@ class NoiseDatagramProtocol(asyncio.DatagramProtocol):
             logger.debug(f"Dropped invalid packet from {addr}")
             return
 
-        self._last_rx = time.monotonic()
+        self._session_timer = _restart_timer(
+            self._session_timer, SESSION_TIMEOUT, self._session_lost
+        )
         if plaintext:
             self.app.datagram_received(plaintext, addr)
 
@@ -280,6 +287,15 @@ class NoiseDatagramProtocol(asyncio.DatagramProtocol):
             return
         self._send(self._session, payload)
 
+    def _start_handshake(self) -> None:
+        """Send a handshake initiation, repeated until the gateway answers."""
+        assert self._transport, "Transport is closed"
+        self._handshake = Handshake(self._psk)
+        self._transport.sendto(self._handshake.initiation())
+        self._handshake_timer = _restart_timer(
+            self._handshake_timer, HANDSHAKE_RETRY, self._start_handshake
+        )
+
     def _on_handshake_response(self, handshake: Handshake, data: bytes) -> None:
         try:
             session = handshake.finish(data)
@@ -289,9 +305,13 @@ class NoiseDatagramProtocol(asyncio.DatagramProtocol):
         if session is None:
             return
 
+        _cancel_timer(self._handshake_timer)
         self._handshake = None
         self._session = session
-        self._last_rx = time.monotonic()
+        self._session_timer = _restart_timer(
+            self._session_timer, SESSION_TIMEOUT, self._session_lost
+        )
+
         # The gateway uses the session once it sees data with the new keys
         self._send(session, b"")
         self.established.set()
@@ -300,29 +320,25 @@ class NoiseDatagramProtocol(asyncio.DatagramProtocol):
     def _send(self, session: Session, plaintext: bytes) -> None:
         assert self._transport, "Transport is closed"
         self._transport.sendto(session.seal(plaintext))
-        self._last_tx = time.monotonic()
+        self._keepalive_timer = _restart_timer(
+            self._keepalive_timer, KEEPALIVE_INTERVAL, self._send_keepalive
+        )
 
-    def _tick(self, now: float) -> None:
-        if self._session and now - self._last_rx >= SESSION_TIMEOUT:
-            logger.warning("Encrypted session lost, reconnecting")
-            self._session = None
-            self.established.clear()
-
-        if self._session is None:
-            if (
-                self._handshake is None
-                or now - self._handshake.started >= HANDSHAKE_RETRY
-            ):
-                assert self._transport, "Transport is closed"
-                self._handshake = Handshake(self._psk, now)
-                self._transport.sendto(self._handshake.initiation())
-        elif now - self._last_tx >= KEEPALIVE_INTERVAL:
+    def _send_keepalive(self) -> None:
+        if self._session:
             self._send(self._session, b"")
 
-    async def _run(self) -> None:
-        while True:
-            self._tick(time.monotonic())
-            await asyncio.sleep(TICK)
+    def _session_lost(self) -> None:
+        logger.warning("Encrypted session lost, reconnecting")
+        self._session = None
+        self.established.clear()
+        _cancel_timer(self._keepalive_timer)
+        self._start_handshake()
+
+    def _cancel_timers(self) -> None:
+        _cancel_timer(self._handshake_timer)
+        _cancel_timer(self._keepalive_timer)
+        _cancel_timer(self._session_timer)
 
 
 class NibeGWNoise(NibeGWBase):
