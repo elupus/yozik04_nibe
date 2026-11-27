@@ -142,8 +142,8 @@ class NibeGWBase(
         """Set up the connection to the gateway."""
 
     @abstractmethod
-    def _send_request(self, data: bytes, write: bool) -> None:
-        """Send a read or write request frame to the gateway."""
+    def _send_request(self, address: int, data: bytes) -> None:
+        """Send a request frame for the given accessory address to the gateway."""
 
     def connection_made(self, transport):
         """Callback when connection is made."""
@@ -251,7 +251,7 @@ class NibeGWBase(
             logger.debug(f"Sending {hexlify(data).decode('utf-8')} (read request)")
 
             try:
-                self._send_request(data, write=False)
+                self._send_request(Address.encmapping["MODBUS40"], data)
             except socket.gaierror:
                 raise ReadSendException(f"Unable to lookup hostname: {self._remote_ip}")
 
@@ -335,7 +335,7 @@ class NibeGWBase(
             logger.debug(f"Sending {hexlify(data).decode('utf-8')} (write request)")
 
             try:
-                self._send_request(data, write=True)
+                self._send_request(Address.encmapping["MODBUS40"], data)
             except socket.gaierror:
                 raise CoilWriteSendException(
                     f"Unable to lookup hostname: {self._remote_ip}"
@@ -497,8 +497,12 @@ class NibeGW(NibeGWBase):
         )
         self._listening_ip = listening_ip
         self._listening_port = listening_port
-        self._remote_read_port = remote_read_port
-        self._remote_write_port = remote_write_port
+        # Plain NibeGW has one port per request type
+        modbus40 = Address.encmapping["MODBUS40"]
+        self._remote_ports = {
+            (modbus40, Command.encmapping["MODBUS_READ_REQ"]): remote_read_port,
+            (modbus40, Command.encmapping["MODBUS_WRITE_REQ"]): remote_write_port,
+        }
 
     async def _open(self) -> None:
         logger.info(f"Starting UDP server on port {self._listening_port}")
@@ -535,9 +539,11 @@ class NibeGW(NibeGWBase):
 
         await asyncio.get_event_loop().create_datagram_endpoint(lambda: self, sock=sock)
 
-    def _send_request(self, data: bytes, write: bool) -> None:
+    def _send_request(self, address: int, data: bytes) -> None:
         assert self._transport, "Transport is closed"
-        port = self._remote_write_port if write else self._remote_read_port
+        port = self._remote_ports.get((address, data[1]))
+        if port is None:
+            raise ValueError(f"No port for request 0x{address:x}:0x{data[1]:x}")
         self._transport.sendto(data, (self._remote_ip, port))
 
 

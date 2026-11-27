@@ -46,8 +46,6 @@ RESPONSE_SIZE = 60
 DATA_HEADER_SIZE = 16
 MAC_SIZE = 16
 
-MODBUS40 = 0x20
-
 HANDSHAKE_RETRY = 2.0
 KEEPALIVE_INTERVAL = 15.0
 # Session considered lost without any packet received in this time
@@ -184,7 +182,8 @@ class NoiseDatagramTransport(asyncio.DatagramTransport):
         self._noise = noise
 
     def sendto(self, data, addr=None) -> None:
-        self._noise.send_request(data)
+        """Send a request frame, addr is the accessory address it is for."""
+        self._noise.send_request(addr, data)
 
     def close(self) -> None:
         self._noise.close()
@@ -262,12 +261,12 @@ class NoiseDatagramProtocol(asyncio.DatagramProtocol):
         # An unreachable gateway is handled by handshake retries
         logger.debug(exc)
 
-    def send_request(self, data: bytes) -> None:
+    def send_request(self, address: int, data: bytes) -> None:
         if not self._session:
             logger.debug("No encrypted session, dropping request")
             return
         token = data[1]
-        self._send(self._session, struct.pack("<HB", MODBUS40, token) + data)
+        self._send(self._session, struct.pack("<HB", address, token) + data)
 
     def _on_handshake_response(self, handshake: Handshake, data: bytes) -> None:
         try:
@@ -357,6 +356,6 @@ class NibeGWNoise(NibeGWBase):
         except asyncio.TimeoutError:
             logger.warning("No encrypted session established yet, retrying")
 
-    def _send_request(self, data: bytes, write: bool) -> None:
+    def _send_request(self, address: int, data: bytes) -> None:
         assert self._transport, "Transport is closed"
-        self._transport.sendto(data)
+        self._transport.sendto(data, address)

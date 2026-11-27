@@ -292,5 +292,5 @@ async def test_write_coil(
 async def test_request_dropped_without_session(
     nibegw: NibeGWNoise, noise: NoiseDatagramProtocol, transport: Mock
 ):
-    noise.send_request(b"\xc0\x69\x02\x98\xa9\x00")
+    noise.send_request(0x20, b"\xc0\x69\x02\x98\xa9\x00")
     transport.sendto.assert_not_called()
