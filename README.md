@@ -113,17 +113,21 @@ if __name__ == '__main__':
 The [ESPHome NibeGW component](https://github.com/elupus/esphome-nibe) can encrypt
 the UDP traffic with a pre-shared key using the same Noise protocol as the ESPHome
 native API. The session is initiated by the library, so no local port is opened and
-a single remote port is used for telegrams, reads and writes.
+a single remote port is used for telegrams, reads and writes. Use it by giving
+`NibeGW` the encrypted transport.
 
 Requires the `noise` extra: `pip install nibe[noise]`
 
 ```python3
-from nibe.connection.nibegw_noise import NibeGWNoise
+from nibe.connection.nibegw import NibeGW
+from nibe.connection.nibegw_noise import NibeGWNoiseTransport
 
-connection = NibeGWNoise(
+connection = NibeGW(
     heatpump=heatpump,
-    remote_ip="192.168.1.2",
-    key="<base64 key from the esphome configuration>",
+    transport=NibeGWNoiseTransport(
+        remote_ip="192.168.1.2",
+        key="<base64 key from the esphome configuration>",
+    ),
 )
 await connection.start()
 ```

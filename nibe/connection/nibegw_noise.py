@@ -27,12 +27,11 @@ import logging
 import secrets
 import struct
 import time
-from typing import Literal, Optional, Union
+from typing import Optional, Union
 
 from nibe.connection.mixins import ConnectionStatus
-from nibe.connection.nibegw import NibeGW
+from nibe.connection.nibegw import NibeGWTransport
 from nibe.exceptions import NibeException
-from nibe.heatpump import HeatPump
 
 logger = logging.getLogger("nibe").getChild(__name__)
 
@@ -178,34 +177,23 @@ class Handshake:
         )
 
 
-class NibeGWNoise(NibeGW):
-    """NibeGW connection over the encrypted ESPHome `udp_noise` transport.
+class NibeGWNoiseTransport(asyncio.DatagramProtocol, NibeGWTransport):
+    """Encrypted transport for the ESPHome nibegw `udp_noise` transport.
 
     The session is initiated from this side, so the gateway address is
-    required and no local port is opened.
+    required and no local port is opened. Use it with NibeGW:
+
+        NibeGW(heatpump, transport=NibeGWNoiseTransport(remote_ip, key))
     """
 
     def __init__(
-        self,
-        heatpump: HeatPump,
-        remote_ip: str,
-        key: Union[str, bytes],
-        remote_port: int = 9999,
-        read_retries: int = 3,
-        write_retries: int = 3,
-        table_processing_mode: Literal["permissive", "strict"] = "permissive",
+        self, remote_ip: str, key: Union[str, bytes], remote_port: int = 9999
     ) -> None:
-        super().__init__(
-            heatpump,
-            remote_ip=remote_ip,
-            remote_read_port=remote_port,
-            remote_write_port=remote_port,
-            read_retries=read_retries,
-            write_retries=write_retries,
-            table_processing_mode=table_processing_mode,
-        )
+        NibeGWTransport.__init__(self)
         self._psk = decode_key(key)
+        self._remote_ip = remote_ip
         self._remote_port = remote_port
+        self._transport: Optional[asyncio.DatagramTransport] = None
         self._session: Optional[Session] = None
         self._handshake: Optional[Handshake] = None
         self._established = asyncio.Event()
@@ -213,12 +201,14 @@ class NibeGWNoise(NibeGW):
         self._last_tx = 0.0
         self._task: Optional[asyncio.Task] = None
 
-    async def start(self):
+    @property
+    def remote_ip(self) -> Optional[str]:
+        return self._remote_ip
+
+    async def start(self) -> None:
         logger.info(
             f"Connecting encrypted session to {self._remote_ip}:{self._remote_port}"
         )
-        self.status = ConnectionStatus.INITIALIZING
-
         await asyncio.get_running_loop().create_datagram_endpoint(
             lambda: self, remote_addr=(self._remote_ip, self._remote_port)
         )
@@ -229,19 +219,22 @@ class NibeGWNoise(NibeGW):
         except asyncio.TimeoutError:
             logger.warning("No encrypted session established yet, retrying")
 
-        if self._heatpump.word_swap is None:
-            await self.detect_word_swap()
-
-    async def stop(self):
+    async def stop(self) -> None:
         if self._task:
             self._task.cancel()
             with suppress(asyncio.CancelledError):
                 await self._task
             self._task = None
+        if self._transport:
+            self._transport.close()
+            self._transport = None
         self._session = None
         self._handshake = None
         self._established.clear()
-        await super().stop()
+
+    def connection_made(self, transport):
+        self._transport = transport
+        self._on_status(ConnectionStatus.LISTENING)
 
     def datagram_received(self, data: bytes, addr):
         if self._handshake and data[:1] == bytes([TYPE_HANDSHAKE_RESPONSE]):
@@ -255,7 +248,18 @@ class NibeGWNoise(NibeGW):
 
         self._last_rx = time.monotonic()
         if plaintext:
-            super().datagram_received(plaintext, addr)
+            self._on_frame(plaintext, addr)
+
+    def error_received(self, exc):
+        # An unreachable gateway is handled by handshake retries
+        logger.debug(exc)
+
+    def send_request(self, data: bytes, write: bool) -> None:
+        if not self._session:
+            logger.debug("No encrypted session, dropping request")
+            return
+        token = data[1]
+        self._send(struct.pack("<HB", MODBUS40, token) + data)
 
     def _on_handshake_response(self, data: bytes) -> None:
         try:
@@ -279,19 +283,12 @@ class NibeGWNoise(NibeGW):
             self._transport.sendto(self._session.seal(plaintext))
             self._last_tx = time.monotonic()
 
-    def _send_request(self, data: bytes, port: int) -> None:
-        if not self._session:
-            logger.debug("No encrypted session, dropping request")
-            return
-        token = data[1]
-        self._send(struct.pack("<HB", MODBUS40, token) + data)
-
     def _tick(self, now: float) -> None:
         if self._session and now - self._last_rx >= SESSION_TIMEOUT:
             logger.warning("Encrypted session lost, reconnecting")
             self._session = None
             self._established.clear()
-            self.status = ConnectionStatus.LISTENING
+            self._on_status(ConnectionStatus.LISTENING)
 
         if self._session is None:
             if (
@@ -308,7 +305,3 @@ class NibeGWNoise(NibeGW):
         while True:
             self._tick(time.monotonic())
             await asyncio.sleep(TICK)
-
-    def error_received(self, exc):
-        # An unreachable gateway is handled by handshake retries
-        logger.debug(exc)

@@ -9,6 +9,7 @@ import pytest
 
 from nibe.coil import CoilData
 from nibe.connection.mixins import ConnectionStatus
+from nibe.connection.nibegw import NibeGW
 from nibe.connection.nibegw_noise import (
     HANDSHAKE_RETRY,
     KEEPALIVE_INTERVAL,
@@ -18,7 +19,7 @@ from nibe.connection.nibegw_noise import (
     TYPE_HANDSHAKE_INITIATION,
     TYPE_HANDSHAKE_RESPONSE,
     Handshake,
-    NibeGWNoise,
+    NibeGWNoiseTransport,
     Session,
     decode_key,
     derive_key,
@@ -81,10 +82,17 @@ async def fixture_transport():
     return Mock()
 
 
+@pytest.fixture(name="noise")
+async def fixture_noise():
+    return NibeGWNoiseTransport("127.0.0.1", KEY)
+
+
 @pytest.fixture(name="nibegw")
-async def fixture_nibegw(heatpump: HeatPump, transport: Mock):
-    nibegw = NibeGWNoise(heatpump, "127.0.0.1", KEY)
-    nibegw.connection_made(transport)
+async def fixture_nibegw(
+    heatpump: HeatPump, noise: NibeGWNoiseTransport, transport: Mock
+):
+    nibegw = NibeGW(heatpump, transport=noise)
+    noise.connection_made(transport)
     yield nibegw
     await nibegw.stop()
 
@@ -93,9 +101,11 @@ def _last_sent(transport: Mock) -> bytes:
     return transport.sendto.call_args.args[0]
 
 
-def _connect(nibegw: NibeGWNoise, transport: Mock, gateway: FakeGateway, now=0.0):
-    nibegw._tick(now)
-    nibegw.datagram_received(gateway.respond(_last_sent(transport)), GW_ADDR)
+def _connect(
+    noise: NibeGWNoiseTransport, transport: Mock, gateway: FakeGateway, now=0.0
+):
+    noise._tick(now)
+    noise.datagram_received(gateway.respond(_last_sent(transport)), GW_ADDR)
     # The client confirms the session with a keepalive
     assert gateway.session.open(_last_sent(transport)) == b""
     transport.sendto.reset_mock()
@@ -159,15 +169,15 @@ def test_session_counters():
 
 
 async def test_handshake_and_telegram(
-    nibegw: NibeGWNoise, transport: Mock, heatpump: HeatPump
+    nibegw: NibeGW, noise: NibeGWNoiseTransport, transport: Mock, heatpump: HeatPump
 ):
     gateway = FakeGateway()
-    _connect(nibegw, transport, gateway)
+    _connect(noise, transport, gateway)
 
     on_coil_update = Mock()
     heatpump.subscribe(HeatPump.COIL_UPDATE_EVENT, on_coil_update)
 
-    nibegw.datagram_received(gateway.telegram("5c00206a0698a9ad0c0000dc"), GW_ADDR)
+    noise.datagram_received(gateway.telegram("5c00206a0698a9ad0c0000dc"), GW_ADDR)
 
     assert nibegw.status == ConnectionStatus.CONNECTED
     coil_data = on_coil_update.call_args.args[0]
@@ -175,60 +185,70 @@ async def test_handshake_and_telegram(
     assert coil_data.value == 3245
 
 
-async def test_wrong_key_retried(nibegw: NibeGWNoise, transport: Mock):
+async def test_wrong_key_retried(
+    nibegw: NibeGW, noise: NibeGWNoiseTransport, transport: Mock
+):
     gateway = FakeGateway(bytes(32))
-    nibegw._tick(0)
+    noise._tick(0)
     assert gateway.respond(_last_sent(transport)) is None
     transport.sendto.reset_mock()
 
-    nibegw._tick(HANDSHAKE_RETRY - 1)
+    noise._tick(HANDSHAKE_RETRY - 1)
     transport.sendto.assert_not_called()
-    nibegw._tick(HANDSHAKE_RETRY)
+    noise._tick(HANDSHAKE_RETRY)
     assert _last_sent(transport)[0] == TYPE_HANDSHAKE_INITIATION
-    assert nibegw._session is None
+    assert noise._session is None
 
 
-async def test_ignores_unrelated_response(nibegw: NibeGWNoise, transport: Mock):
-    nibegw._tick(0)
+async def test_ignores_unrelated_response(
+    nibegw: NibeGW, noise: NibeGWNoiseTransport, transport: Mock
+):
+    noise._tick(0)
     response = FakeGateway().respond(Handshake(PSK).initiation())
-    nibegw.datagram_received(response, GW_ADDR)
-    assert nibegw._session is None
+    noise.datagram_received(response, GW_ADDR)
+    assert noise._session is None
 
 
-async def test_ignores_forged_data(nibegw: NibeGWNoise, transport: Mock):
+async def test_ignores_forged_data(
+    nibegw: NibeGW, noise: NibeGWNoiseTransport, transport: Mock
+):
     gateway = FakeGateway()
-    _connect(nibegw, transport, gateway)
-    forged = Session(b"\x05" * 32, b"\x06" * 32, 0, nibegw._session.local_index)
-    nibegw.datagram_received(forged.seal(b"\x5c"), GW_ADDR)
+    _connect(noise, transport, gateway)
+    forged = Session(b"\x05" * 32, b"\x06" * 32, 0, noise._session.local_index)
+    noise.datagram_received(forged.seal(b"\x5c"), GW_ADDR)
     assert nibegw.status != ConnectionStatus.CONNECTED
 
 
-async def test_keepalive(nibegw: NibeGWNoise, transport: Mock):
+async def test_keepalive(nibegw: NibeGW, noise: NibeGWNoiseTransport, transport: Mock):
     gateway = FakeGateway()
-    _connect(nibegw, transport, gateway)
-    nibegw._last_rx = nibegw._last_tx = 100
-    nibegw._tick(100 + KEEPALIVE_INTERVAL - 1)
+    _connect(noise, transport, gateway)
+    noise._last_rx = noise._last_tx = 100
+    noise._tick(100 + KEEPALIVE_INTERVAL - 1)
     transport.sendto.assert_not_called()
-    nibegw._tick(100 + KEEPALIVE_INTERVAL)
+    noise._tick(100 + KEEPALIVE_INTERVAL)
     assert gateway.session.open(_last_sent(transport)) == b""
 
 
-async def test_lost_session_reconnects(nibegw: NibeGWNoise, transport: Mock):
+async def test_lost_session_reconnects(
+    nibegw: NibeGW, noise: NibeGWNoiseTransport, transport: Mock
+):
     gateway = FakeGateway()
-    _connect(nibegw, transport, gateway)
-    nibegw._last_rx = 100
-    nibegw._tick(100 + SESSION_TIMEOUT)
-    assert nibegw._session is None
+    _connect(noise, transport, gateway)
+    noise._last_rx = 100
+    noise._tick(100 + SESSION_TIMEOUT)
+    assert noise._session is None
     assert nibegw.status == ConnectionStatus.LISTENING
     assert _last_sent(transport)[0] == TYPE_HANDSHAKE_INITIATION
 
-    nibegw.datagram_received(gateway.respond(_last_sent(transport)), GW_ADDR)
-    assert nibegw._session is not None
+    noise.datagram_received(gateway.respond(_last_sent(transport)), GW_ADDR)
+    assert noise._session is not None
 
 
-async def test_read_coil(nibegw: NibeGWNoise, transport: Mock, heatpump: HeatPump):
+async def test_read_coil(
+    nibegw: NibeGW, noise: NibeGWNoiseTransport, transport: Mock, heatpump: HeatPump
+):
     gateway = FakeGateway()
-    _connect(nibegw, transport, gateway)
+    _connect(noise, transport, gateway)
     coil = heatpump.get_coil_by_address(43416)
 
     async def respond():
@@ -236,16 +256,18 @@ async def test_read_coil(nibegw: NibeGWNoise, transport: Mock, heatpump: HeatPum
         request = gateway.session.open(_last_sent(transport))
         assert struct.unpack("<HB", request[:3]) == (0x20, 0x69)
         assert request[3:] == binascii.unhexlify("c0690298a99a")
-        nibegw.datagram_received(gateway.telegram("5c00206a0698a9ad0c0000dc"), GW_ADDR)
+        noise.datagram_received(gateway.telegram("5c00206a0698a9ad0c0000dc"), GW_ADDR)
 
     asyncio.create_task(respond())
     data = await nibegw.read_coil(coil)
     assert data.value == 3245
 
 
-async def test_write_coil(nibegw: NibeGWNoise, transport: Mock, heatpump: HeatPump):
+async def test_write_coil(
+    nibegw: NibeGW, noise: NibeGWNoiseTransport, transport: Mock, heatpump: HeatPump
+):
     gateway = FakeGateway()
-    _connect(nibegw, transport, gateway)
+    _connect(noise, transport, gateway)
     coil = heatpump.get_coil_by_address(48132)
 
     async def respond():
@@ -253,12 +275,14 @@ async def test_write_coil(nibegw: NibeGWNoise, transport: Mock, heatpump: HeatPu
         request = gateway.session.open(_last_sent(transport))
         assert struct.unpack("<HB", request[:3]) == (0x20, 0x6B)
         assert request[3:] == binascii.unhexlify("c06b0604bc0400000011")
-        nibegw.datagram_received(gateway.telegram("5c00206c01014c"), GW_ADDR)
+        noise.datagram_received(gateway.telegram("5c00206c01014c"), GW_ADDR)
 
     asyncio.create_task(respond())
     await nibegw.write_coil(CoilData(coil, "One time increase"))
 
 
-async def test_request_dropped_without_session(nibegw: NibeGWNoise, transport: Mock):
-    nibegw._send_request(b"\xc0\x69\x02\x98\xa9\x00", 9999)
+async def test_request_dropped_without_session(
+    nibegw: NibeGW, noise: NibeGWNoiseTransport, transport: Mock
+):
+    noise.send_request(b"\xc0\x69\x02\x98\xa9\x00", write=False)
     transport.sendto.assert_not_called()

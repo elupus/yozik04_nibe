@@ -1,3 +1,4 @@
+from abc import ABC, abstractmethod
 import asyncio
 from asyncio import CancelledError, Future, InvalidStateError
 from binascii import hexlify
@@ -12,7 +13,7 @@ import logging
 from operator import xor
 import socket
 import struct
-from typing import Any, Dict, Literal, Optional, Union
+from typing import Any, Callable, Dict, Literal, Optional, Union
 
 from construct import (
     Adapter,
@@ -86,61 +87,71 @@ class CoilAction:
     future: Future
 
 
-class NibeGW(asyncio.DatagramProtocol, Connection, EventServer, ConnectionStatusMixin):
-    """NibeGW connection."""
+class NibeGWTransport(ABC):
+    """Network side of a NibeGW connection.
 
-    PRODUCT_INFO_EVENT = "product_info"
-    _futures: Dict[str, Future]
-    _registered_reads: Dict[str, CoilAction]
+    A transport delivers frames received from the gateway to the frame callback
+    and sends request frames to the gateway.
+    """
+
+    def __init__(self) -> None:
+        self._on_frame: Callable[[bytes, Any], None] = lambda data, addr: None
+        self._on_status: Callable[[ConnectionStatus], None] = lambda status: None
+
+    def set_callbacks(
+        self,
+        on_frame: Callable[[bytes, Any], None],
+        on_status: Callable[[ConnectionStatus], None],
+    ) -> None:
+        self._on_frame = on_frame
+        self._on_status = on_status
+
+    @property
+    @abstractmethod
+    def remote_ip(self) -> Optional[str]:
+        """Address of the gateway, if known."""
+
+    @abstractmethod
+    async def start(self) -> None:
+        """Start receiving frames."""
+
+    @abstractmethod
+    async def stop(self) -> None:
+        """Stop the transport."""
+
+    @abstractmethod
+    def send_request(self, data: bytes, write: bool) -> None:
+        """Send a read or write request frame to the gateway."""
+
+    def response_received(self, addr) -> None:  # noqa: B027
+        """A valid response frame was received from addr."""
+
+
+class NibeGWUdpTransport(asyncio.DatagramProtocol, NibeGWTransport):
+    """Plaintext UDP transport of the NibeGW protocol."""
 
     def __init__(
         self,
-        heatpump: HeatPump,
         remote_ip: Optional[str] = None,
         remote_read_port: int = 9999,
         remote_write_port: int = 10000,
         listening_ip: str = "0.0.0.0",
         listening_port: int = 9999,
-        read_retries: int = 3,
-        write_retries: int = 3,
-        table_processing_mode: Literal["permissive", "strict"] = "permissive",
     ) -> None:
-        super().__init__()
-
-        self._heatpump = heatpump
+        NibeGWTransport.__init__(self)
         self._listening_ip = listening_ip
         self._listening_port = listening_port
-
         self._remote_ip = remote_ip
         self._remote_read_port = remote_read_port
         self._remote_write_port = remote_write_port
-
-        self._table_processing_mode = table_processing_mode
-
         self._transport = None
 
-        self._send_lock = asyncio.Lock()
-        self._futures = {}
-        self._registered_reads = {}
+    @property
+    def remote_ip(self) -> Optional[str]:
+        return self._remote_ip
 
-        self.coil_encoder = CoilDataEncoderNibeGw(heatpump.word_swap)
-
-        self.read_coil = retry(
-            retry=retry_if_exception_type(ReadIOException),
-            stop=stop_after_attempt(read_retries),
-            reraise=True,
-        )(self.read_coil)
-
-        self.write_coil = retry(
-            retry=retry_if_exception_type(WriteIOException),
-            stop=stop_after_attempt(write_retries),
-            reraise=True,
-        )(self.write_coil)
-
-    async def start(self):
+    async def start(self) -> None:
         logger.info(f"Starting UDP server on port {self._listening_port}")
-
-        self.status = ConnectionStatus.INITIALIZING
 
         family, type, proto, _, sockaddr = socket.getaddrinfo(
             self._listening_ip,
@@ -174,16 +185,107 @@ class NibeGW(asyncio.DatagramProtocol, Connection, EventServer, ConnectionStatus
 
         await asyncio.get_event_loop().create_datagram_endpoint(lambda: self, sock=sock)
 
-        if self._heatpump.word_swap is None:
-            await self.detect_word_swap()
+    async def stop(self) -> None:
+        if self._transport:
+            self._transport.close()
+            self._transport = None
 
     def connection_made(self, transport):
         """Callback when connection is made."""
-        self.status = ConnectionStatus.LISTENING
         self._transport = transport
+        self._on_status(ConnectionStatus.LISTENING)
 
     def datagram_received(self, data: bytes, addr):
         """Callback when data is received."""
+        self._on_frame(data, addr)
+
+    def error_received(self, exc):
+        """Handle errors from the transport"""
+        logger.error(exc)
+
+    def response_received(self, addr) -> None:
+        if not self._remote_ip:
+            logger.debug("Pump discovered at %s", addr)
+            self._remote_ip = addr[0]
+
+    def send_request(self, data: bytes, write: bool) -> None:
+        assert self._transport, "Transport is closed"
+        port = self._remote_write_port if write else self._remote_read_port
+        logger.debug(
+            f"Sending {hexlify(data).decode('utf-8')} to {self._remote_ip}:{port}"
+        )
+        self._transport.sendto(data, (self._remote_ip, port))
+
+
+class NibeGW(Connection, EventServer, ConnectionStatusMixin):
+    """NibeGW connection.
+
+    Uses plaintext UDP unless another transport is given.
+    """
+
+    PRODUCT_INFO_EVENT = "product_info"
+    _futures: Dict[str, Future]
+    _registered_reads: Dict[str, CoilAction]
+
+    def __init__(
+        self,
+        heatpump: HeatPump,
+        remote_ip: Optional[str] = None,
+        remote_read_port: int = 9999,
+        remote_write_port: int = 10000,
+        listening_ip: str = "0.0.0.0",
+        listening_port: int = 9999,
+        read_retries: int = 3,
+        write_retries: int = 3,
+        table_processing_mode: Literal["permissive", "strict"] = "permissive",
+        transport: Optional[NibeGWTransport] = None,
+    ) -> None:
+        super().__init__()
+
+        self._heatpump = heatpump
+        self._table_processing_mode = table_processing_mode
+
+        if transport is None:
+            transport = NibeGWUdpTransport(
+                remote_ip,
+                remote_read_port,
+                remote_write_port,
+                listening_ip,
+                listening_port,
+            )
+        self._transport = transport
+        transport.set_callbacks(self.datagram_received, self._on_transport_status)
+
+        self._send_lock = asyncio.Lock()
+        self._futures = {}
+        self._registered_reads = {}
+
+        self.coil_encoder = CoilDataEncoderNibeGw(heatpump.word_swap)
+
+        self.read_coil = retry(
+            retry=retry_if_exception_type(ReadIOException),
+            stop=stop_after_attempt(read_retries),
+            reraise=True,
+        )(self.read_coil)
+
+        self.write_coil = retry(
+            retry=retry_if_exception_type(WriteIOException),
+            stop=stop_after_attempt(write_retries),
+            reraise=True,
+        )(self.write_coil)
+
+    async def start(self):
+        self.status = ConnectionStatus.INITIALIZING
+        await self._transport.start()
+
+        if self._heatpump.word_swap is None:
+            await self.detect_word_swap()
+
+    def _on_transport_status(self, status: ConnectionStatus) -> None:
+        self.status = status
+
+    def datagram_received(self, data: bytes, addr):
+        """Handle frames received by the transport."""
         logger.debug(f"Received {hexlify(data).decode('utf-8')} from {addr}")
 
         try:
@@ -208,10 +310,7 @@ class NibeGW(asyncio.DatagramProtocol, Connection, EventServer, ConnectionStatus
             logger.debug(block)
 
     def _on_response(self, msg: Container[Any], addr) -> None:
-        if not self._remote_ip:
-            logger.debug("Pump discovered at %s", addr)
-            self._remote_ip = addr[0]
-
+        self._transport.response_received(addr)
         self.status = ConnectionStatus.CONNECTED
 
         logger.debug(msg.fields.value)
@@ -267,7 +366,6 @@ class NibeGW(asyncio.DatagramProtocol, Connection, EventServer, ConnectionStatus
 
     async def read_coil(self, coil: Coil, timeout: float = DEFAULT_TIMEOUT) -> CoilData:
         async with self._send_lock:
-            assert self._transport, "Transport is closed"
             data = Request.build(
                 dict(
                     fields=dict(
@@ -280,14 +378,12 @@ class NibeGW(asyncio.DatagramProtocol, Connection, EventServer, ConnectionStatus
 
             future = self._register_coil_read_request(coil)
 
-            logger.debug(
-                f"Sending {hexlify(data).decode('utf-8')} (read request) to {self._remote_ip}:{self._remote_write_port}"
-            )
+            logger.debug(f"Sending read request for {coil.name}")
 
             try:
-                self._send_request(data, self._remote_read_port)
+                self._transport.send_request(data, write=False)
             except socket.gaierror:
-                raise ReadSendException(f"Unable to lookup hostname: {self._remote_ip}")
+                raise ReadSendException(f"Unable to lookup hostname: {self.remote_ip}")
 
             logger.debug(f"Waiting for read response for {coil.name}")
 
@@ -349,7 +445,6 @@ class NibeGW(asyncio.DatagramProtocol, Connection, EventServer, ConnectionStatus
         assert coil.is_writable, f"{coil.name} is not writable"
         assert coil_data.value is not None, f"{coil.name} value must be set"
         async with self._send_lock:
-            assert self._transport, "Transport is closed"
             data = Request.build(
                 dict(
                     fields=dict(
@@ -366,15 +461,13 @@ class NibeGW(asyncio.DatagramProtocol, Connection, EventServer, ConnectionStatus
 
             self._futures["write"] = asyncio.get_event_loop().create_future()
 
-            logger.debug(
-                f"Sending {hexlify(data).decode('utf-8')} (write request) to {self._remote_ip}:{self._remote_write_port}"
-            )
+            logger.debug(f"Sending write request for {coil.name}")
 
             try:
-                self._send_request(data, self._remote_write_port)
+                self._transport.send_request(data, write=True)
             except socket.gaierror:
                 raise CoilWriteSendException(
-                    f"Unable to lookup hostname: {self._remote_ip}"
+                    f"Unable to lookup hostname: {self.remote_ip}"
                 )
 
             try:
@@ -393,19 +486,10 @@ class NibeGW(asyncio.DatagramProtocol, Connection, EventServer, ConnectionStatus
             finally:
                 del self._futures["write"]
 
-    def _send_request(self, data: bytes, port: int) -> None:
-        """Send a request frame to the gateway."""
-        assert self._transport, "Transport is closed"
-        self._transport.sendto(data, (self._remote_ip, port))
-
-    def error_received(self, exc):
-        """Handle errors from the transport"""
-        logger.error(exc)
-
     @property
     def remote_ip(self) -> Optional[str]:
         """Get the remote IP address"""
-        return self._remote_ip
+        return self._transport.remote_ip
 
     def _on_rmu_data(self, value: Container):
         data = value.data
@@ -507,9 +591,7 @@ class NibeGW(asyncio.DatagramProtocol, Connection, EventServer, ConnectionStatus
         await verify_connectivity_read_write_alarm(self, self._heatpump)
 
     async def stop(self):
-        if self._transport:
-            self._transport.close()
-            self._transport = None
+        await self._transport.stop()
         await asyncio.sleep(0)
         self.status = ConnectionStatus.DISCONNECTED
 
