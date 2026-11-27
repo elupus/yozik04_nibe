@@ -122,7 +122,8 @@ class NibeGWTransport(ABC):
     def send_request(self, data: bytes, write: bool) -> None:
         """Send a read or write request frame to the gateway."""
 
-    def response_received(self, addr) -> None:  # noqa: B027
+    @abstractmethod
+    def response_received(self, addr: Any) -> None:
         """A valid response frame was received from addr."""
 
 
@@ -188,20 +189,20 @@ class NibeGWUdpTransport(asyncio.DatagramProtocol, NibeGWTransport):
             self._transport.close()
             self._transport = None
 
-    def connection_made(self, transport):
+    def connection_made(self, transport) -> None:
         """Callback when connection is made."""
         self._transport = transport
         self._on_status(ConnectionStatus.LISTENING)
 
-    def datagram_received(self, data: bytes, addr):
+    def datagram_received(self, data: bytes, addr: Any) -> None:
         """Callback when data is received."""
         self._on_frame(data, addr)
 
-    def error_received(self, exc):
+    def error_received(self, exc: Exception) -> None:
         """Handle errors from the transport"""
         logger.error(exc)
 
-    def response_received(self, addr) -> None:
+    def response_received(self, addr: Any) -> None:
         if not self._remote_ip:
             logger.debug("Pump discovered at %s", addr)
             self._remote_ip = addr[0]

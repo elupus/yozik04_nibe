@@ -27,7 +27,7 @@ import logging
 import secrets
 import struct
 import time
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from nibe.connection.mixins import ConnectionStatus
 from nibe.connection.nibegw import NibeGWTransport
@@ -231,13 +231,13 @@ class NibeGWNoiseTransport(asyncio.DatagramProtocol, NibeGWTransport):
         self._handshake = None
         self._established.clear()
 
-    def connection_made(self, transport):
+    def connection_made(self, transport) -> None:
         self._transport = transport
         self._on_status(ConnectionStatus.LISTENING)
 
-    def datagram_received(self, data: bytes, addr):
+    def datagram_received(self, data: bytes, addr: Any) -> None:
         if self._handshake and data[:1] == bytes([TYPE_HANDSHAKE_RESPONSE]):
-            self._on_handshake_response(data)
+            self._on_handshake_response(self._handshake, data)
             return
 
         plaintext = self._session.open(data) if self._session else None
@@ -249,9 +249,13 @@ class NibeGWNoiseTransport(asyncio.DatagramProtocol, NibeGWTransport):
         if plaintext:
             self._on_frame(plaintext, addr)
 
-    def error_received(self, exc):
+    def error_received(self, exc: Exception) -> None:
         # An unreachable gateway is handled by handshake retries
         logger.debug(exc)
+
+    def response_received(self, addr: Any) -> None:
+        # The gateway address is configured, nothing to discover
+        pass
 
     def send_request(self, data: bytes, write: bool) -> None:
         if not self._session:
@@ -260,9 +264,9 @@ class NibeGWNoiseTransport(asyncio.DatagramProtocol, NibeGWTransport):
         token = data[1]
         self._send(self._session, struct.pack("<HB", MODBUS40, token) + data)
 
-    def _on_handshake_response(self, data: bytes) -> None:
+    def _on_handshake_response(self, handshake: Handshake, data: bytes) -> None:
         try:
-            session = self._handshake.finish(data)
+            session = handshake.finish(data)
         except Exception as err:
             logger.debug(f"Invalid handshake response: {err}")
             return
