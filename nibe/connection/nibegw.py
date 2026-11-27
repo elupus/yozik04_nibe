@@ -1,4 +1,3 @@
-from abc import ABC, abstractmethod
 import asyncio
 from asyncio import CancelledError, Future, InvalidStateError
 from binascii import hexlify
@@ -13,7 +12,7 @@ import logging
 from operator import xor
 import socket
 import struct
-from typing import Any, Dict, Literal, Optional, Union
+from typing import Any, Callable, Dict, Literal, Optional, Union
 
 from construct import (
     Adapter,
@@ -87,30 +86,32 @@ class CoilAction:
     future: Future
 
 
-class NibeGWBase(
-    asyncio.DatagramProtocol, Connection, EventServer, ConnectionStatusMixin, ABC
-):
-    """NibeGW protocol, independent of how frames reach the gateway."""
+class NibeGWProtocol:
+    """NibeGW protocol logic, independent of how frames reach the gateway.
 
-    PRODUCT_INFO_EVENT = "product_info"
+    Parses frames received from the gateway, decodes coil values and builds
+    request frames, which are sent with the send callback as
+    send(accessory address, frame).
+    """
+
     _futures: Dict[str, Future]
     _registered_reads: Dict[str, CoilAction]
 
     def __init__(
         self,
         heatpump: HeatPump,
-        remote_ip: Optional[str] = None,
+        send: Callable[[int, bytes], None],
+        on_response: Callable[[Any], None],
+        on_product_info: Callable[[ProductInfo], None],
         read_retries: int = 3,
         write_retries: int = 3,
         table_processing_mode: Literal["permissive", "strict"] = "permissive",
     ) -> None:
-        super().__init__()
-
         self._heatpump = heatpump
-        self._remote_ip = remote_ip
+        self._send = send
+        self._on_response_callback = on_response
+        self._on_product_info = on_product_info
         self._table_processing_mode = table_processing_mode
-
-        self._transport = None
 
         self._send_lock = asyncio.Lock()
         self._futures = {}
@@ -130,28 +131,8 @@ class NibeGWBase(
             reraise=True,
         )(self.write_coil)
 
-    async def start(self):
-        self.status = ConnectionStatus.INITIALIZING
-        await self._open()
-
-        if self._heatpump.word_swap is None:
-            await self.detect_word_swap()
-
-    @abstractmethod
-    async def _open(self) -> None:
-        """Set up the connection to the gateway."""
-
-    @abstractmethod
-    def _send_request(self, address: int, data: bytes) -> None:
-        """Send a request frame for the given accessory address to the gateway."""
-
-    def connection_made(self, transport):
-        """Callback when connection is made."""
-        self.status = ConnectionStatus.LISTENING
-        self._transport = transport
-
-    def datagram_received(self, data: bytes, addr):
-        """Callback when data is received."""
+    def frame_received(self, data: bytes, addr: Any) -> None:
+        """Handle data received from the gateway."""
         logger.debug(f"Received {hexlify(data).decode('utf-8')} from {addr}")
 
         try:
@@ -176,11 +157,7 @@ class NibeGWBase(
             logger.debug(block)
 
     def _on_response(self, msg: Container[Any], addr) -> None:
-        if not self._remote_ip:
-            logger.debug("Pump discovered at %s", addr)
-            self._remote_ip = addr[0]
-
-        self.status = ConnectionStatus.CONNECTED
+        self._on_response_callback(addr)
 
         logger.debug(msg.fields.value)
         cmd = msg.fields.value.cmd
@@ -204,9 +181,7 @@ class NibeGWBase(
             product_info = ProductInfo(data["model"], data["version"])
             with suppress(InvalidStateError, CancelledError, KeyError):
                 self._futures["product_info"].set_result(product_info)
-            self.notify_event_listeners(
-                self.PRODUCT_INFO_EVENT, product_info=product_info
-            )
+            self._on_product_info(product_info)
         elif not isinstance(cmd, EnumIntegerString):
             logger.debug(f"Unknown command {cmd}")
 
@@ -235,7 +210,6 @@ class NibeGWBase(
 
     async def read_coil(self, coil: Coil, timeout: float = DEFAULT_TIMEOUT) -> CoilData:
         async with self._send_lock:
-            assert self._transport, "Transport is closed"
             data = Request.build(
                 dict(
                     fields=dict(
@@ -251,9 +225,9 @@ class NibeGWBase(
             logger.debug(f"Sending {hexlify(data).decode('utf-8')} (read request)")
 
             try:
-                self._send_request(int(Address.MODBUS40), data)
-            except socket.gaierror:
-                raise ReadSendException(f"Unable to lookup hostname: {self._remote_ip}")
+                self._send(int(Address.MODBUS40), data)
+            except socket.gaierror as e:
+                raise ReadSendException(f"Unable to lookup hostname: {e}")
 
             logger.debug(f"Waiting for read response for {coil.name}")
 
@@ -315,7 +289,6 @@ class NibeGWBase(
         assert coil.is_writable, f"{coil.name} is not writable"
         assert coil_data.value is not None, f"{coil.name} value must be set"
         async with self._send_lock:
-            assert self._transport, "Transport is closed"
             data = Request.build(
                 dict(
                     fields=dict(
@@ -335,11 +308,9 @@ class NibeGWBase(
             logger.debug(f"Sending {hexlify(data).decode('utf-8')} (write request)")
 
             try:
-                self._send_request(int(Address.MODBUS40), data)
-            except socket.gaierror:
-                raise CoilWriteSendException(
-                    f"Unable to lookup hostname: {self._remote_ip}"
-                )
+                self._send(int(Address.MODBUS40), data)
+            except socket.gaierror as e:
+                raise CoilWriteSendException(f"Unable to lookup hostname: {e}")
 
             try:
                 await asyncio.wait_for(self._futures["write"], timeout)
@@ -356,15 +327,6 @@ class NibeGWBase(
                 )
             finally:
                 del self._futures["write"]
-
-    def error_received(self, exc):
-        """Handle errors from the transport"""
-        logger.error(exc)
-
-    @property
-    def remote_ip(self) -> Optional[str]:
-        """Get the remote IP address"""
-        return self._remote_ip
 
     def _on_rmu_data(self, value: Container):
         data = value.data
@@ -462,19 +424,11 @@ class NibeGWBase(
         except NibeException as e:
             self._on_coil_read_error(coil_address, value, e)
 
-    async def verify_connectivity(self):
-        await verify_connectivity_read_write_alarm(self, self._heatpump)
 
-    async def stop(self):
-        if self._transport:
-            self._transport.close()
-            self._transport = None
-        await asyncio.sleep(0)
-        self.status = ConnectionStatus.DISCONNECTED
-
-
-class NibeGW(NibeGWBase):
+class NibeGW(asyncio.DatagramProtocol, Connection, EventServer, ConnectionStatusMixin):
     """NibeGW connection over plaintext UDP."""
+
+    PRODUCT_INFO_EVENT = "product_info"
 
     def __init__(
         self,
@@ -488,24 +442,32 @@ class NibeGW(NibeGWBase):
         write_retries: int = 3,
         table_processing_mode: Literal["permissive", "strict"] = "permissive",
     ) -> None:
-        super().__init__(
+        super().__init__()
+
+        self._heatpump = heatpump
+        self._listening_ip = listening_ip
+        self._listening_port = listening_port
+
+        self._remote_ip = remote_ip
+        self._remote_read_port = remote_read_port
+        self._remote_write_port = remote_write_port
+
+        self._transport = None
+
+        self._protocol = NibeGWProtocol(
             heatpump,
-            remote_ip=remote_ip,
+            send=self._send_request,
+            on_response=self._on_response,
+            on_product_info=self._on_product_info,
             read_retries=read_retries,
             write_retries=write_retries,
             table_processing_mode=table_processing_mode,
         )
-        self._listening_ip = listening_ip
-        self._listening_port = listening_port
-        # Plain NibeGW has one port per request type
-        modbus40 = int(Address.MODBUS40)
-        self._remote_ports = {
-            (modbus40, int(Command.MODBUS_READ_REQ)): remote_read_port,
-            (modbus40, int(Command.MODBUS_WRITE_REQ)): remote_write_port,
-        }
 
-    async def _open(self) -> None:
+    async def start(self):
         logger.info(f"Starting UDP server on port {self._listening_port}")
+
+        self.status = ConnectionStatus.INITIALIZING
 
         family, type, proto, _, sockaddr = socket.getaddrinfo(
             self._listening_ip,
@@ -539,12 +501,75 @@ class NibeGW(NibeGWBase):
 
         await asyncio.get_event_loop().create_datagram_endpoint(lambda: self, sock=sock)
 
+        if self._heatpump.word_swap is None:
+            await self._protocol.detect_word_swap()
+
+    def connection_made(self, transport):
+        """Callback when connection is made."""
+        self.status = ConnectionStatus.LISTENING
+        self._transport = transport
+
+    def datagram_received(self, data: bytes, addr):
+        """Callback when data is received."""
+        self._protocol.frame_received(data, addr)
+
+    def error_received(self, exc):
+        """Handle errors from the transport"""
+        logger.error(exc)
+
     def _send_request(self, address: int, data: bytes) -> None:
         assert self._transport, "Transport is closed"
-        port = self._remote_ports.get((address, data[1]))
+        ports = {
+            (
+                int(Address.MODBUS40),
+                int(Command.MODBUS_READ_REQ),
+            ): self._remote_read_port,
+            (
+                int(Address.MODBUS40),
+                int(Command.MODBUS_WRITE_REQ),
+            ): self._remote_write_port,
+        }
+        port = ports.get((address, data[1]))
         if port is None:
             raise ValueError(f"No port for request 0x{address:x}:0x{data[1]:x}")
         self._transport.sendto(data, (self._remote_ip, port))
+
+    def _on_response(self, addr) -> None:
+        if not self._remote_ip:
+            logger.debug("Pump discovered at %s", addr)
+            self._remote_ip = addr[0]
+        self.status = ConnectionStatus.CONNECTED
+
+    def _on_product_info(self, product_info: ProductInfo) -> None:
+        self.notify_event_listeners(self.PRODUCT_INFO_EVENT, product_info=product_info)
+
+    @property
+    def remote_ip(self) -> Optional[str]:
+        """Get the remote IP address"""
+        return self._remote_ip
+
+    async def read_coil(self, coil: Coil, timeout: float = DEFAULT_TIMEOUT) -> CoilData:
+        return await self._protocol.read_coil(coil, timeout)
+
+    async def write_coil(
+        self, coil_data: CoilData, timeout: float = DEFAULT_TIMEOUT
+    ) -> None:
+        await self._protocol.write_coil(coil_data, timeout)
+
+    async def read_product_info(
+        self, timeout: float = READ_PRODUCT_INFO_TIMEOUT
+    ) -> ProductInfo:
+        return await self._protocol.read_product_info(timeout)
+
+    async def verify_connectivity(self):
+        await verify_connectivity_read_write_alarm(self, self._heatpump)
+
+    async def stop(self):
+        if self._transport:
+            self._transport.close()
+            self._transport = None
+        await asyncio.sleep(0)
+        self.status = ConnectionStatus.DISCONNECTED
 
 
 def xor8(data: bytes) -> int:

@@ -31,8 +31,17 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from noise.connection import NoiseConnection
 
-from nibe.connection.nibegw import NibeGWBase
-from nibe.heatpump import HeatPump
+from nibe.coil import Coil, CoilData
+from nibe.connection import (
+    DEFAULT_TIMEOUT,
+    READ_PRODUCT_INFO_TIMEOUT,
+    Connection,
+    verify_connectivity_read_write_alarm,
+)
+from nibe.connection.mixins import ConnectionStatus, ConnectionStatusMixin
+from nibe.connection.nibegw import NibeGWProtocol
+from nibe.event_server import EventServer
+from nibe.heatpump import HeatPump, ProductInfo
 
 logger = logging.getLogger("nibe").getChild(__name__)
 
@@ -312,12 +321,16 @@ class NoiseTransport(asyncio.DatagramTransport, asyncio.DatagramProtocol):
         _cancel_timer(self._session_timer)
 
 
-class NibeGWNoise(NibeGWBase):
+class NibeGWNoise(
+    asyncio.DatagramProtocol, Connection, EventServer, ConnectionStatusMixin
+):
     """NibeGW connection over the encrypted ESPHome `udp_noise` transport.
 
     The session is initiated from this side, so the gateway address is
     required and no local port is opened.
     """
+
+    PRODUCT_INFO_EVENT = "product_info"
 
     def __init__(
         self,
@@ -329,18 +342,24 @@ class NibeGWNoise(NibeGWBase):
         write_retries: int = 3,
         table_processing_mode: Literal["permissive", "strict"] = "permissive",
     ) -> None:
-        super().__init__(
+        super().__init__()
+        self._heatpump = heatpump
+        self._remote_ip = remote_ip
+        self._remote_port = remote_port
+        self._psk = decode_key(key)
+        self._transport: Optional[asyncio.DatagramTransport] = None
+        self._protocol = NibeGWProtocol(
             heatpump,
-            remote_ip=remote_ip,
+            send=self._send_request,
+            on_response=self._on_response,
+            on_product_info=self._on_product_info,
             read_retries=read_retries,
             write_retries=write_retries,
             table_processing_mode=table_processing_mode,
         )
-        self._psk = decode_key(key)
-        self._remote_port = remote_port
 
-    async def _open(self) -> None:
-        assert self._remote_ip, "Gateway address is required"
+    async def start(self):
+        self.status = ConnectionStatus.INITIALIZING
         logger.info(
             f"Connecting encrypted session to {self._remote_ip}:{self._remote_port}"
         )
@@ -354,7 +373,50 @@ class NibeGWNoise(NibeGWBase):
         except asyncio.TimeoutError:
             logger.warning("No encrypted session established yet, retrying")
 
+        if self._heatpump.word_swap is None:
+            await self._protocol.detect_word_swap()
+
+    def connection_made(self, transport) -> None:
+        self.status = ConnectionStatus.LISTENING
+        self._transport = transport
+
+    def datagram_received(self, data: bytes, addr: Any) -> None:
+        self._protocol.frame_received(data, addr)
+
     def _send_request(self, address: int, data: bytes) -> None:
         assert self._transport, "Transport is closed"
         token = data[1]
         self._transport.sendto(struct.pack("<HB", address, token) + data)
+
+    def _on_response(self, addr: Any) -> None:
+        self.status = ConnectionStatus.CONNECTED
+
+    def _on_product_info(self, product_info: ProductInfo) -> None:
+        self.notify_event_listeners(self.PRODUCT_INFO_EVENT, product_info=product_info)
+
+    @property
+    def remote_ip(self) -> Optional[str]:
+        return self._remote_ip
+
+    async def read_coil(self, coil: Coil, timeout: float = DEFAULT_TIMEOUT) -> CoilData:
+        return await self._protocol.read_coil(coil, timeout)
+
+    async def write_coil(
+        self, coil_data: CoilData, timeout: float = DEFAULT_TIMEOUT
+    ) -> None:
+        await self._protocol.write_coil(coil_data, timeout)
+
+    async def read_product_info(
+        self, timeout: float = READ_PRODUCT_INFO_TIMEOUT
+    ) -> ProductInfo:
+        return await self._protocol.read_product_info(timeout)
+
+    async def verify_connectivity(self):
+        await verify_connectivity_read_write_alarm(self, self._heatpump)
+
+    async def stop(self):
+        if self._transport:
+            self._transport.close()
+            self._transport = None
+        await asyncio.sleep(0)
+        self.status = ConnectionStatus.DISCONNECTED

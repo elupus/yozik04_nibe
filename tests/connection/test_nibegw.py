@@ -287,7 +287,7 @@ async def test_read_multiple_with_u32(
     table_processing_mode: str,
     calls: list[tuple[int, Any]],
 ):
-    nibegw._table_processing_mode = table_processing_mode
+    nibegw._protocol._table_processing_mode = table_processing_mode
     on_coil_update_mock = Mock()
     heatpump.subscribe("coil_update", on_coil_update_mock)
     nibegw.datagram_received(
