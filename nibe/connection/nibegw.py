@@ -251,7 +251,7 @@ class NibeGWBase(
             logger.debug(f"Sending {hexlify(data).decode('utf-8')} (read request)")
 
             try:
-                self._send_request(Address.encmapping["MODBUS40"], data)
+                self._send_request(int(Address.MODBUS40), data)
             except socket.gaierror:
                 raise ReadSendException(f"Unable to lookup hostname: {self._remote_ip}")
 
@@ -335,7 +335,7 @@ class NibeGWBase(
             logger.debug(f"Sending {hexlify(data).decode('utf-8')} (write request)")
 
             try:
-                self._send_request(Address.encmapping["MODBUS40"], data)
+                self._send_request(int(Address.MODBUS40), data)
             except socket.gaierror:
                 raise CoilWriteSendException(
                     f"Unable to lookup hostname: {self._remote_ip}"
@@ -498,10 +498,10 @@ class NibeGW(NibeGWBase):
         self._listening_ip = listening_ip
         self._listening_port = listening_port
         # Plain NibeGW has one port per request type
-        modbus40 = Address.encmapping["MODBUS40"]
+        modbus40 = int(Address.MODBUS40)
         self._remote_ports = {
-            (modbus40, Command.encmapping["MODBUS_READ_REQ"]): remote_read_port,
-            (modbus40, Command.encmapping["MODBUS_WRITE_REQ"]): remote_write_port,
+            (modbus40, int(Command.MODBUS_READ_REQ)): remote_read_port,
+            (modbus40, int(Command.MODBUS_WRITE_REQ)): remote_write_port,
         }
 
     async def _open(self) -> None:
