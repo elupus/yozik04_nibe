@@ -27,8 +27,11 @@ import secrets
 import struct
 from typing import Any, Callable, Literal, Optional, Union
 
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+from noise.connection import NoiseConnection
+
 from nibe.connection.nibegw import NibeGWBase
-from nibe.exceptions import NibeException
 from nibe.heatpump import HeatPump
 
 logger = logging.getLogger("nibe").getChild(__name__)
@@ -50,17 +53,6 @@ KEEPALIVE_INTERVAL = 15.0
 # Session considered lost without any packet received in this time
 SESSION_TIMEOUT = 3 * KEEPALIVE_INTERVAL
 START_TIMEOUT = 5.0
-
-
-def _import_crypto():
-    try:
-        from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
-        from noise.connection import NoiseConnection
-    except ImportError as err:  # pragma: no cover
-        raise NibeException(
-            "Encrypted NibeGW requires the 'noise' extra: pip install nibe[noise]"
-        ) from err
-    return ChaCha20Poly1305, NoiseConnection
 
 
 def decode_key(key: Union[str, bytes]) -> bytes:
@@ -85,7 +77,6 @@ def _header(message_type: int) -> bytes:
 
 def derive_key(noise_key: bytes) -> bytes:
     """Transport data key from a Noise transport key."""
-    ChaCha20Poly1305, _ = _import_crypto()
     return ChaCha20Poly1305(noise_key).encrypt(
         _nonce(KEY_DERIVE_NONCE), bytes(32), None
     )[:32]
@@ -97,7 +88,6 @@ class Session:
     def __init__(
         self, tx_key: bytes, rx_key: bytes, local_index: int, remote_index: int
     ) -> None:
-        ChaCha20Poly1305, _ = _import_crypto()
         self._tx = ChaCha20Poly1305(tx_key)
         self._rx = ChaCha20Poly1305(rx_key)
         self.local_index = local_index
@@ -127,7 +117,7 @@ class Session:
             plaintext = self._rx.decrypt(
                 _nonce(counter), packet[DATA_HEADER_SIZE:], None
             )
-        except Exception:  # cryptography.exceptions.InvalidTag
+        except InvalidTag:
             return None
         self._rx_counter = counter + 1
         return plaintext
@@ -137,7 +127,6 @@ class Handshake:
     """Initiator side of the handshake."""
 
     def __init__(self, psk: bytes) -> None:
-        _, NoiseConnection = _import_crypto()
         self.sender_index = secrets.randbits(32)
         self._noise = NoiseConnection.from_name(PROTOCOL_NAME)
         self._noise.set_as_initiator()
