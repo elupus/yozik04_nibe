@@ -114,6 +114,27 @@ if __name__ == '__main__':
 `connection = NibeGW(heatpump=heatpump, remote_ip="192.168.1.2")` with
 `await connection.start()` is still supported and does the same.
 
+#### Encrypted NibeGW (ESPHome `udp_noise`)
+
+The [ESPHome NibeGW component](https://github.com/elupus/esphome-nibe) can encrypt
+the UDP traffic with a pre-shared key using the same Noise protocol as the ESPHome
+native API. The session is initiated by the library, so no local port is opened and
+a single remote port is used for telegrams, reads and writes.
+
+Requires the `noise` extra: `pip install nibe[noise]`. Use the example above
+with the encrypted connection instead of the UDP connection:
+
+```python3
+from nibe.connection.nibegw_noise import create_nibegw_noise_connection
+
+transport, protocol = await create_nibegw_noise_connection(
+    lambda: NibeGWProtocol(heatpump),
+    remote_ip="192.168.1.2",
+    key="<base64 key from the esphome configuration>",
+)
+await protocol.start()
+```
+
 ### TCP Modbus
 
 With S series heatpumps
